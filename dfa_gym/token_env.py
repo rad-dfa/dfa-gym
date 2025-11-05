@@ -363,7 +363,7 @@ class TokenEnv(MultiAgentEnv):
         # [ 9 ][   ][   ][   ][   ][   ][   ][ # ][ 7 ][   ][   ][ 6 ]
         # where each [] indicates a cell, uppercase letters indicate agents,
         # e.g., A and B, and lower case letters indicate "sync" points which
-        # are more like doors and buttons that open the doors, eg [#|a] is a
+        # are more like doors and buttons that open the doors, eg [#,a] is a
         # door that is open if there is an agent on the cell [ a ] and closed;
         # otherwise, and cells with # indicate walls.
 
