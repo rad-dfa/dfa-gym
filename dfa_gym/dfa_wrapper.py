@@ -23,7 +23,7 @@ class DFAWrapper(MultiAgentEnv):
     def __init__(
         self,
         env: MultiAgentEnv,
-        gamma: float | None = 0.99,
+        gamma: float | None = None,
         sampler: DFASampler = RADSampler(),
         binary_reward: bool = True,
         progress: bool = True,
