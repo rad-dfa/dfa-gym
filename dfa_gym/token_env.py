@@ -71,6 +71,10 @@ class TokenEnv(MultiAgentEnv):
         self.init_state = None
         if layout is not None:
             self.init_state = self.parse(layout)
+        elif self.fixed_map_seed is not None:
+            key = jax.random.PRNGKey(self.fixed_map_seed)
+            self.init_state = self.sample_init_state(key)
+
         self.num_agents = self.n_agents
 
         channel_dim = 1
@@ -314,8 +318,6 @@ class TokenEnv(MultiAgentEnv):
         self,
         key: chex.PRNGKey
     ) -> Tuple[Dict[str, chex.Array], TokenEnvState]:
-        if self.fixed_map_seed is not None:
-            key = jax.random.PRNGKey(self.fixed_map_seed)
 
         grid_points = jnp.stack(jnp.meshgrid(jnp.arange(self.grid_shape[0]), jnp.arange(self.grid_shape[1])), -1)
         grid_flat = grid_points.reshape(-1, 2)
