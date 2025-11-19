@@ -15,7 +15,8 @@ from dfax.samplers import DFASampler, RADSampler
 class DFAWrapperState(State):
     dfas: Dict[str, dfax.DFAx]
     init_dfas: Dict[str, dfax.DFAx]
-    token_event_assgn: chex.Array
+    token_to_event: chex.Array
+    event_to_token: chex.Array
     env_obs: chex.Array
     env_state: State
 
@@ -36,7 +37,7 @@ class DFAWrapper(MultiAgentEnv):
         self.binary_reward = binary_reward
         self.progress = progress
 
-        assert self.sampler.n_tokens == self.env.n_tokens
+        assert self.sampler.n_tokens <= self.env.n_tokens
 
         self.agents = [f"agent_{i}" for i in range(self.num_agents)]
 
@@ -82,7 +83,8 @@ class DFAWrapper(MultiAgentEnv):
             )
 
         # Assign tokens to env events
-        token_event_assgn = jax.random.choice(keys[4], self.env.n_events, shape=(self.sampler.n_tokens,), replace=False)
+        token_to_event = jax.random.choice(keys[4], self.env.n_events, shape=(self.sampler.n_tokens,), replace=False)
+        event_to_token = (-jnp.ones(self.env.n_events, dtype=jnp.int32)).at[token_to_event].set(jnp.arange(self.sampler.n_tokens))
 
         dfas_tree = jax.vmap(sample_dfa)(keys[5:], mask)
 
@@ -94,7 +96,8 @@ class DFAWrapper(MultiAgentEnv):
         state = DFAWrapperState(
             dfas=dfas,
             init_dfas={agent: dfas[agent] for agent in self.agents},
-            token_event_assgn=token_event_assgn,
+            token_to_event=token_to_event,
+            event_to_token=event_to_token,
             env_obs=env_obs,
             env_state=env_state
         )
@@ -112,10 +115,10 @@ class DFAWrapper(MultiAgentEnv):
 
         env_obs, env_state, env_rewards, env_dones, env_info = self.env.step_env(key, state.env_state, action)
 
-        symbols = self.env.label_f(env_state)
+        events = self.env.label_f(env_state)
 
         dfas = {
-            agent: state.dfas[agent].advance(symbols[agent]).minimize()
+            agent: state.dfas[agent].advance(state.event_to_token[events[agent]]).minimize()
             for agent in self.agents
         }
 
@@ -148,7 +151,8 @@ class DFAWrapper(MultiAgentEnv):
         state = DFAWrapperState(
             dfas=dfas,
             init_dfas=state.init_dfas,
-            token_event_assgn=state.token_event_assgn,
+            token_to_event=state.token_to_event,
+            event_to_token=state.event_to_token,
             env_obs=env_obs,
             env_state=env_state
         )
@@ -179,7 +183,7 @@ class DFAWrapper(MultiAgentEnv):
                 "_id": i,
                 "obs": state.env_obs[agent],
                 "dfa": dfas,
-                "tkn": jnp.stack([self.env.get_agent_obs_for_event(event, agent, i, state.env_state) for event in state.token_event_assgn], axis=0)
+                "tkn": jnp.stack([self.env.get_agent_obs_for_event(event, agent, i, state.env_state) for event in state.token_to_event], axis=0)
             }
             for i, agent in enumerate(self.agents)
         }
