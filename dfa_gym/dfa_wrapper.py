@@ -57,9 +57,7 @@ class DFAWrapper(MultiAgentEnv):
                     "current_state": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(self.num_agents,), dtype=jnp.int32),
                     "n_states": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(max_dfa_size*self.num_agents,), dtype=jnp.int32)
                 }),
-                "tkn": spaces.Dict({
-                    i: self.env.per_agent_event_obs_space for i in range(self.sampler.n_tokens)
-                }),
+                "tkn": spaces.Box(low=0, high=1, shape=(self.sampler.n_tokens, self.env.n_token_repeat,) + self.env.obs_shape, dtype=jnp.uint8)
             })
             for agent in self.agents
         }
@@ -181,7 +179,7 @@ class DFAWrapper(MultiAgentEnv):
                 "_id": i,
                 "obs": state.env_obs[agent],
                 "dfa": dfas,
-                "tkn": {token: self.env.get_agent_obs_for_event(event, agent, i, state.env_state) for token, event in enumerate(state.token_event_assgn)}
+                "tkn": jnp.stack([self.env.get_agent_obs_for_event(event, agent, i, state.env_state) for event in state.token_event_assgn], axis=0)
             }
             for i, agent in enumerate(self.agents)
         }
