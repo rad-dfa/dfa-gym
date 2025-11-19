@@ -58,7 +58,7 @@ class DFAWrapper(MultiAgentEnv):
                     "n_states": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(max_dfa_size*self.num_agents,), dtype=jnp.int32)
                 }),
                 "tkn": spaces.Dict({
-                    i: self.env.observation_space(agent) for i in range(self.sampler.n_tokens)
+                    i: self.env.per_agent_event_obs_space for i in range(self.sampler.n_tokens)
                 }),
             })
             for agent in self.agents

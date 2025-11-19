@@ -68,9 +68,11 @@ class TokenEnv(MultiAgentEnv):
 
         self.agents = [f"agent_{i}" for i in range(self.n_agents)]
 
+        self.layout = layout
+
         self.init_state = None
-        if layout is not None:
-            self.init_state = self.parse(layout)
+        if self.layout is not None:
+            self.init_state = self.parse(self.layout)
         elif self.fixed_map_seed is not None:
             key = jax.random.PRNGKey(self.fixed_map_seed)
             self.init_state = self.sample_init_state(key)
@@ -78,7 +80,7 @@ class TokenEnv(MultiAgentEnv):
         self.num_agents = self.n_agents
 
         channel_dim = 1
-        if self.init_state is not None: channel_dim += 2
+        if self.layout is not None: channel_dim += 2
         if self.n_tokens > 0: channel_dim += self.n_tokens
         if self.n_agents > 1: channel_dim += self.n_agents - 1
         if self.n_buttons > 0: channel_dim += 3 * self.n_buttons
@@ -92,6 +94,8 @@ class TokenEnv(MultiAgentEnv):
             agent: spaces.Box(low=0, high=1, shape=self.obs_shape, dtype=jnp.uint8)
             for agent in self.agents
         }
+
+        self.per_agent_event_obs_space = spaces.Box(low=0, high=1, shape=(self.n_token_repeat,) + self.obs_shape, dtype=jnp.uint8)
 
         if self.init_state is not None:
             self.agent_event_obss = {agent: self.get_agent_event_obss(agent, i, self.init_state) for i, agent in enumerate(self.agents)}
@@ -122,7 +126,7 @@ class TokenEnv(MultiAgentEnv):
         new_agent_pos = jax.vmap(move_agent, in_axes=(0, 0))(state.agent_positions, _actions)
         new_agent_pos = jnp.where(state.is_alive[:, None], new_agent_pos, state.agent_positions)
 
-        if self.init_state is not None:
+        if self.layout is not None:
             # Handle wall collisions
             def compute_wall_collisions(pos, wall_positions, is_wall_disabled):
                 return jnp.any(
@@ -209,7 +213,7 @@ class TokenEnv(MultiAgentEnv):
         rewards = {agent: _rewards[i] for i, agent in enumerate(self.agents)}
 
         is_wall_disabled = jnp.empty((0, 2), dtype=bool)
-        if self.init_state is not None:
+        if self.layout is not None:
             is_wall_disabled = self.compute_disabled_walls(new_agent_pos, state.wall_positions, state.button_positions)
 
         new_state = TokenEnvState(
@@ -251,7 +255,7 @@ class TokenEnv(MultiAgentEnv):
             b = place_agent(b)
             idx_offset += 1
 
-            if self.init_state is not None:
+            if self.layout is not None:
                 def place_wall(val):
                     rel = (state.wall_positions + offset) % self.grid_shape_arr
                     return val.at[
