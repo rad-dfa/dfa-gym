@@ -58,7 +58,9 @@ class DFAWrapper(MultiAgentEnv):
                     "current_state": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(self.num_agents,), dtype=jnp.int32),
                     "n_states": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(max_dfa_size*self.num_agents,), dtype=jnp.int32)
                 }),
-                "tkn": spaces.Box(low=0, high=1, shape=(self.sampler.n_tokens, self.env.n_token_repeat,) + self.env.obs_shape, dtype=jnp.uint8)
+                # "tkn": spaces.Box(low=0, high=1, shape=(self.sampler.n_tokens, self.env.n_token_repeat,) + self.env.obs_shape, dtype=jnp.uint8)
+                # "tkn": spaces.Box(low=0, high=1, shape=(self.sampler.n_tokens, self.env.n_events), dtype=jnp.uint8)
+                "tkn": spaces.Box(low=0, high=1, shape=(self.sampler.n_tokens,), dtype=jnp.uint8)
             })
             for agent in self.agents
         }
@@ -183,7 +185,9 @@ class DFAWrapper(MultiAgentEnv):
                 "_id": i,
                 "obs": state.env_obs[agent],
                 "dfa": dfas,
-                "tkn": jnp.stack([self.env.get_agent_obs_for_event(event, agent, i, state.env_state) for event in state.token_to_event], axis=0)
+                # "tkn": jnp.stack([self.env.get_agent_obs_for_event(event, agent, i, state.env_state) for event in state.token_to_event], axis=0)
+                # "tkn": jax.nn.one_hot(state.token_to_event, self.env.n_events)
+                "tkn": state.token_to_event
             }
             for i, agent in enumerate(self.agents)
         }
