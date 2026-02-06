@@ -9,11 +9,10 @@ This repo implements (Multi-Agent) Reinforcement Learning environments in JAX fo
 
 ## Installation
 
-This package will soon be made pip-installable. In the meantime, pull the repo and and install locally.
+Install using pip.
 
 ```
-git clone https://github.com/rad-dfa/dfa-gym.git
-pip install -e dfa-gym
+pip install dfa-gym
 ```
 
 ## TokenEnv
