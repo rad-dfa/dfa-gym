@@ -27,6 +27,8 @@ class DFAWrapper(MultiAgentEnv):
         sampler: DFASampler = RADSampler(),
         binary_reward: bool = True,
         progress: bool = True,
+        embedder: Callable[[dfax.DFAx], jnp.ndarray] | None = None,
+        embedding_dim: int | None = None,
     ) -> None:
         super().__init__(num_agents=env.num_agents)
         self.env = env
@@ -34,7 +36,10 @@ class DFAWrapper(MultiAgentEnv):
         self.sampler = sampler
         self.binary_reward = binary_reward
         self.progress = progress
+        self.embedder = embedder
+        self.embedding_dim = embedding_dim
 
+        assert (self.embedder is None) == (self.embedding_dim is None)
         assert self.sampler.n_tokens == self.env.n_tokens
 
         self.agents = [f"agent_{i}" for i in range(self.num_agents)]
@@ -45,20 +50,31 @@ class DFAWrapper(MultiAgentEnv):
         }
         max_dfa_size = self.sampler.max_size
         n_tokens = self.sampler.n_tokens
-        self.observation_spaces = {
-            agent: spaces.Dict({
-                "_id": spaces.Discrete(self.num_agents),
-                "obs": self.env.observation_space(agent),
-                "dfa": spaces.Dict({
-                    "node_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*self.num_agents, 4), dtype=jnp.float32),
-                    "edge_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*self.num_agents*max_dfa_size*self.num_agents, n_tokens + 8), dtype=jnp.float32),
-                    "edge_index": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(2, max_dfa_size*self.num_agents*max_dfa_size*self.num_agents), dtype=jnp.int32),
-                    "current_state": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(self.num_agents,), dtype=jnp.int32),
-                    "n_states": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(max_dfa_size*self.num_agents,), dtype=jnp.int32)
-                }),
-            })
-            for agent in self.agents
-        }
+
+        if self.embedder is None:
+            self.observation_spaces = {
+                agent: spaces.Dict({
+                    "_id": spaces.Discrete(self.num_agents),
+                    "obs": self.env.observation_space(agent),
+                    "dfa": spaces.Dict({
+                        "node_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*self.num_agents, 4), dtype=jnp.float32),
+                        "edge_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*self.num_agents*max_dfa_size*self.num_agents, n_tokens + 8), dtype=jnp.float32),
+                        "edge_index": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(2, max_dfa_size*self.num_agents*max_dfa_size*self.num_agents), dtype=jnp.int32),
+                        "current_state": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(self.num_agents,), dtype=jnp.int32),
+                        "n_states": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(max_dfa_size*self.num_agents,), dtype=jnp.int32)
+                    }),
+                })
+                for agent in self.agents
+            }
+        else:
+            self.observation_spaces = {
+                agent: spaces.Dict({
+                    "_id": spaces.Discrete(self.num_agents),
+                    "obs": self.env.observation_space(agent),
+                    "dfa": spaces.Box(low=-jnp.inf, high=jnp.inf, shape=(self.num_agents, self.embedding_dim), dtype=jnp.float32)
+                })
+                for agent in self.agents
+            }
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(
@@ -155,18 +171,24 @@ class DFAWrapper(MultiAgentEnv):
         self,
         state: DFAWrapperState
     ) -> Dict[str, chex.Array]:
-        if self.progress:
-            dfas = batch2graph(
-                list2batch(
-                    [state.dfas[agent].to_graph() for agent in self.agents]
+        if self.embedder is None:
+            if self.progress:
+                dfas = batch2graph(
+                    list2batch(
+                        [state.dfas[agent].to_graph() for agent in self.agents]
+                    )
                 )
-            )
+            else:
+                dfas = batch2graph(
+                    list2batch(
+                        [state.init_dfas[agent].to_graph() for agent in self.agents]
+                    )
+                )
         else:
-            dfas = batch2graph(
-                list2batch(
-                    [state.init_dfas[agent].to_graph() for agent in self.agents]
-                )
-            )
+            if self.progress:
+                dfas = jnp.array([self.embedder(state.dfas[agent]) for agent in self.agents])
+            else:
+                dfas = jnp.array([self.embedder(state.init_dfas[agent]) for agent in self.agents])
         return {
             agent: {
                 "_id": i,
