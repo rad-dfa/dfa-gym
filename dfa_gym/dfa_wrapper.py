@@ -71,7 +71,7 @@ class DFAWrapper(MultiAgentEnv):
                 agent: spaces.Dict({
                     "_id": spaces.Discrete(self.num_agents),
                     "obs": self.env.observation_space(agent),
-                    "dfa": spaces.Box(low=-jnp.inf, high=jnp.inf, shape=(self.num_agents, self.embedding_dim), dtype=jnp.float32)
+                    "dfa": spaces.Box(low=-1, high=1, shape=(self.num_agents, self.embedding_dim), dtype=jnp.float32)
                 })
                 for agent in self.agents
             }
