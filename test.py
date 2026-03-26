@@ -4,7 +4,7 @@ from dfa_gym import TokenEnv, DFABisimEnv, DFAWrapper
 
 def test(env):
 
-    key = jax.random.PRNGKey(1133)
+    key = jax.random.PRNGKey(42)
 
     n = 100
 
@@ -56,21 +56,6 @@ def test(env):
         print(f"Test completed for {i + 1} samples.", end="\r")
 
     print(f"Test completed for {n} samples.")
-
-# layout = """
-# 8....#0....1
-# .....#......
-# ..b..#......
-# .....#3....2
-# .....#####a#
-# A...........
-# B...........
-# .....#####b#
-# .....#4....5
-# ..a..#......
-# .....#......
-# 9....#7....6
-# """
 
 # layout = """
 # [ 8 ][   ][   ][   ][   ][   ][   ][ # ][ 0 ][   ][   ][ 1 ]
@@ -133,9 +118,9 @@ layout = """
     """
 
 if __name__ == '__main__':
-    # test(env=TokenEnv(is_circular=True, is_walled=True, collision_reward=-1e2))
+    # test(env=TokenEnv())
     # test(env=DFABisimEnv())
-    # test(env=DFAWrapper(env=TokenEnv(grid_shape=(4,7), n_token_repeat=1, n_agents=2, is_circular=False, is_walled=True)))
+    test(env=DFAWrapper(env=TokenEnv(grid_shape=(7,7), n_token_repeat=2, n_agents=2)))
     # from dfax.samplers import ReachSampler, ReachAvoidSampler, RADSampler
     # test(env=DFAWrapper(
     #     TokenEnv(layout=layout, max_steps_in_episode=200),
@@ -147,18 +132,16 @@ if __name__ == '__main__':
     # env.render(env.init_state)
     # input()
 
-    sampler = data2sampler("dataset.pkl")
-
-    env = DFAWrapper(
-        env=TokenEnv(
-            grid_shape=(7,7),
-            n_token_repeat=2,
-            n_agents=2,
-        ),
-        sampler = sampler,
-        embedder = sampler.embed,
-        embedding_dim = sampler.embd_dim
-    )
-
-    test(env=env)
+    # sampler = data2sampler("dataset.pkl")
+    # env = DFAWrapper(
+    #     env=TokenEnv(
+    #         grid_shape=(7,7),
+    #         n_token_repeat=2,
+    #         n_agents=2,
+    #     ),
+    #     sampler = sampler,
+    #     embedder = sampler.embed,
+    #     embedding_dim = sampler.embd_dim
+    # )
+    # test(env=env)
 
