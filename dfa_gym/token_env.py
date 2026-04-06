@@ -62,15 +62,25 @@ class TokenEnv(MultiAgentEnv):
         self.black_death = black_death
         self.n_buttons = 0
 
+        # In TokenEnv, events are the same thing as tokens.
+        # In general, for example, an event can be entering the kitchen, etc.
+        self.n_events = self.n_tokens
+
         self.agents = [f"agent_{i}" for i in range(self.n_agents)]
 
+        self.layout = layout
+
         self.init_state = None
-        if layout is not None:
-            self.init_state = self.parse(layout)
+        if self.layout is not None:
+            self.init_state = self.parse(self.layout)
+        elif self.fixed_map_seed is not None:
+            key = jax.random.PRNGKey(self.fixed_map_seed)
+            self.init_state = self.sample_init_state(key)
+
         self.num_agents = self.n_agents
 
         channel_dim = 1
-        if self.init_state is not None: channel_dim += 2
+        if self.layout is not None: channel_dim += 2
         if self.n_tokens > 0: channel_dim += self.n_tokens
         if self.n_agents > 1: channel_dim += self.n_agents - 1
         if self.n_buttons > 0: channel_dim += 3 * self.n_buttons
@@ -84,6 +94,11 @@ class TokenEnv(MultiAgentEnv):
             agent: spaces.Box(low=0, high=1, shape=self.obs_shape, dtype=jnp.uint8)
             for agent in self.agents
         }
+
+        self.per_agent_event_obs_space = spaces.Box(low=0, high=1, shape=(self.n_token_repeat,) + self.obs_shape, dtype=jnp.uint8)
+
+        if self.init_state is not None:
+            self.agent_event_obss = {agent: self.get_agent_event_obss(agent, i, self.init_state) for i, agent in enumerate(self.agents)}
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(
@@ -111,7 +126,7 @@ class TokenEnv(MultiAgentEnv):
         new_agent_pos = jax.vmap(move_agent, in_axes=(0, 0))(state.agent_positions, _actions)
         new_agent_pos = jnp.where(state.is_alive[:, None], new_agent_pos, state.agent_positions)
 
-        if self.init_state is not None:
+        if self.layout is not None:
             # Handle wall collisions
             def compute_wall_collisions(pos, wall_positions, is_wall_disabled):
                 return jnp.any(
@@ -198,7 +213,7 @@ class TokenEnv(MultiAgentEnv):
         rewards = {agent: _rewards[i] for i, agent in enumerate(self.agents)}
 
         is_wall_disabled = jnp.empty((0, 2), dtype=bool)
-        if self.init_state is not None:
+        if self.layout is not None:
             is_wall_disabled = self.compute_disabled_walls(new_agent_pos, state.wall_positions, state.button_positions)
 
         new_state = TokenEnvState(
@@ -240,7 +255,7 @@ class TokenEnv(MultiAgentEnv):
             b = place_agent(b)
             idx_offset += 1
 
-            if self.init_state is not None:
+            if self.layout is not None:
                 def place_wall(val):
                     rel = (state.wall_positions + offset) % self.grid_shape_arr
                     return val.at[
@@ -307,8 +322,6 @@ class TokenEnv(MultiAgentEnv):
         self,
         key: chex.PRNGKey
     ) -> Tuple[Dict[str, chex.Array], TokenEnvState]:
-        if self.fixed_map_seed is not None:
-            key = jax.random.PRNGKey(self.fixed_map_seed)
 
         grid_points = jnp.stack(jnp.meshgrid(jnp.arange(self.grid_shape[0]), jnp.arange(self.grid_shape[1])), -1)
         grid_flat = grid_points.reshape(-1, 2)
@@ -346,6 +359,45 @@ class TokenEnv(MultiAgentEnv):
             # A wall is disabled if *any* matching button is pressed
             return jnp.any(jnp.logical_and(on_buttons, jnp.any(eq, axis=-1)))
         return jax.vmap(_compute_disabled_walls, in_axes=(0, None, None))(wall_positions, on_buttons, button_positions)
+
+    @partial(jax.jit, static_argnums=(0, 2, 3))
+    def get_agent_obs_for_event(
+        self,
+        event: int,
+        agent: str,
+        agent_idx: int,
+        init_state: TokenEnvState
+    ) -> chex.Array:
+        if self.init_state is not None:
+            return self.agent_event_obss[agent][event]
+
+        def gen_obs(state, token_pos):
+            new_agent_positions = state.agent_positions.at[agent_idx].set(token_pos)
+            new_state = state.replace(agent_positions=new_agent_positions)
+            return self.get_obs(new_state)
+
+        event_obss = jax.vmap(gen_obs, (None, 0))(init_state, init_state.token_positions[event])
+
+        return event_obss[agent]
+
+
+    @partial(jax.jit, static_argnums=(0, 1))
+    def get_agent_event_obss(
+        self,
+        agent: str,
+        agent_idx: int,
+        init_state: TokenEnvState
+    ) -> chex.Array:
+        def gen_obs(state, event):
+            def _gen_obs(_state, token_pos):
+                new_agent_positions = _state.agent_positions.at[agent_idx].set(token_pos)
+                new_state = _state.replace(agent_positions=new_agent_positions)
+                return self.get_obs(new_state)
+            return jax.vmap(_gen_obs, (None, 0))(state, state.token_positions[event])
+
+        self.event_obss = jax.vmap(gen_obs, (None, 0))(init_state, jnp.arange(self.n_events))
+
+        return self.event_obss[agent]
 
     def parse(self, layout: str) -> TokenEnvState:
         # Example layout:
