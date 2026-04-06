@@ -1,9 +1,10 @@
 import jax
+from dfax import data2sampler
 from dfa_gym import TokenEnv, DFABisimEnv, DFAWrapper
 
 def test(env):
 
-    key = jax.random.PRNGKey(1133)
+    key = jax.random.PRNGKey(42)
 
     n = 100
 
@@ -24,6 +25,17 @@ def test(env):
             #     actions[agent] = int(input(f"Action for {agent}\n"))
             key, subkey = jax.random.split(key)
             obs, state, rewards, dones, info = env.step(actions=actions, state=state, key=subkey)
+
+            # dfax = state.dfas["agent_0"]
+            # temp = env.sampler.embed(dfax)
+            # import dill
+            # import jax.numpy as jnp
+            # with open("dataset.pkl", "rb") as f:
+            #     data = dill.load(f)
+            # _, embed = data[dfax]
+            # embed = jnp.array(embed)
+            # assert (temp == embed).all()
+
             # env.render(state)
             # print(obs)
             # jax.numpy.set_printoptions(threshold=10000)
@@ -44,21 +56,6 @@ def test(env):
         print(f"Test completed for {i + 1} samples.", end="\r")
 
     print(f"Test completed for {n} samples.")
-
-# layout = """
-# 8....#0....1
-# .....#......
-# ..b..#......
-# .....#3....2
-# .....#####a#
-# A...........
-# B...........
-# .....#####b#
-# .....#4....5
-# ..a..#......
-# .....#......
-# 9....#7....6
-# """
 
 # layout = """
 # [ 8 ][   ][   ][   ][   ][   ][   ][ # ][ 0 ][   ][   ][ 1 ]
@@ -121,17 +118,30 @@ layout = """
     """
 
 if __name__ == '__main__':
-    # test(env=TokenEnv(is_circular=True, is_walled=True, collision_reward=-1e2))
+    # test(env=TokenEnv())
     # test(env=DFABisimEnv())
-    # test(env=DFAWrapper(env=TokenEnv(grid_shape=(4,7), n_token_repeat=1, n_agents=2, is_circular=False, is_walled=True)))
-    from dfax.samplers import ReachSampler, ReachAvoidSampler, RADSampler
-    test(env=DFAWrapper(
-        TokenEnv(layout=layout, max_steps_in_episode=200),
-        sampler=ReachAvoidSampler(max_size=4, p=None, prob_stutter=1.0)
-        )
-    )
+    test(env=DFAWrapper(env=TokenEnv(grid_shape=(7,7), n_token_repeat=2, n_agents=2)))
+    # from dfax.samplers import ReachSampler, ReachAvoidSampler, RADSampler
+    # test(env=DFAWrapper(
+    #     TokenEnv(layout=layout, max_steps_in_episode=200),
+    #     sampler=ReachAvoidSampler(max_size=4, p=None, prob_stutter=1.0)
+    #     )
+    # )
     # env=TokenEnv(layout=layout)
     # print(env.init_state)
     # env.render(env.init_state)
     # input()
+
+    # sampler = data2sampler("dataset.pkl")
+    # env = DFAWrapper(
+    #     env=TokenEnv(
+    #         grid_shape=(7,7),
+    #         n_token_repeat=2,
+    #         n_agents=2,
+    #     ),
+    #     sampler = sampler,
+    #     embedder = sampler.embed,
+    #     embedding_dim = sampler.embd_dim
+    # )
+    # test(env=env)
 
