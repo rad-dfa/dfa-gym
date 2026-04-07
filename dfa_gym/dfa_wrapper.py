@@ -138,11 +138,14 @@ class DFAWrapper(MultiAgentEnv):
             )
 
         if self.dynamic_alphabet:
-            sym2tkn = jax.random.choice(keys[4], self.n_tkns, shape=(self.n_syms,), replace=False)
-            tkn2sym = (-jnp.ones(self.n_tkns, dtype=jnp.int32)).at[sym2tkn].set(jnp.arange(self.n_syms))
+            sym2tkn = jax.random.choice(keys[4], self.n_tkns, shape=(self.n_syms,), replace=False, dtype=jnp.int32)
+            tkn2sym = (-jnp.ones(self.n_tkns, dtype=jnp.int32)).at[sym2tkn].set(jnp.arange(self.n_syms, dtype=jnp.int32))
         else:
-            sym2tkn = jnp.arange(self.n_syms)
-            tkn2sym = (-jnp.ones(self.n_tkns, dtype=jnp.int32)).at[sym2tkn].set(jnp.arange(self.n_syms))
+            sym2tkn = jnp.arange(self.n_syms, dtype=jnp.int32)
+            tkn2sym = (-jnp.ones(self.n_tkns, dtype=jnp.int32)).at[sym2tkn].set(jnp.arange(self.n_syms, dtype=jnp.int32))
+
+        sym2tkn = jnp.append(sym2tkn, -jnp.ones(1, dtype=jnp.int32))
+        tkn2sym = jnp.append(tkn2sym, -jnp.ones(1, dtype=jnp.int32))
 
         dfas_tree = jax.vmap(sample_dfa)(keys[5:], mask)
 
