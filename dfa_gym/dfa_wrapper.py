@@ -212,8 +212,8 @@ class DFAWrapper(MultiAgentEnv):
             init_dfas=state.init_dfas,
             env_obs=env_obs,
             env_state=env_state,
-            sym2tkn=sym2tkn,
-            tkn2sym=tkn2sym,
+            sym2tkn=state.sym2tkn,
+            tkn2sym=state.tkn2sym,
         )
 
         obs = self.get_obs(state=state)
