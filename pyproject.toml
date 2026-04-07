@@ -1,6 +1,6 @@
 [project]
 name = "dfa-gym"
-version = "0.2.9"
+version = "0.2.10"
 description = "Python library for playing DFA bisimulation games and wrapping other RL environments with DFA goals."
 authors = [
     { name = "Beyazit Yalcinkaya", email = "beyazit@berkeley.edu" }
@@ -8,12 +8,12 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "dfax>=0.1.12",
+    "dfax>=0.1.13",
 ]
 
 [project.optional-dependencies]
 cuda = [
-    "dfax[cuda]>=0.1.12",
+    "dfax[cuda]>=0.1.13",
 ]
 
 [build-system]
