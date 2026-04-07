@@ -263,7 +263,7 @@ class DFAWrapper(MultiAgentEnv):
             if embs is not None:
                 entry["emb"] = embs
             if self.dynamic_alphabet:
-                entry["tkn"] = state.sym2tkn
+                entry["tkn"] = state.sym2tkn[:-1]
             return entry
 
         return {agent: make_entry(i, agent) for i, agent in enumerate(self.agents)}

@@ -309,7 +309,7 @@ wheels = [
 
 [[package]]
 name = "dfa-gym"
-version = "0.2.9"
+version = "0.2.13"
 source = { editable = "." }
 dependencies = [
     { name = "dfax" },
@@ -322,13 +322,13 @@ cuda = [
 
 [package.metadata]
 requires-dist = [
-    { name = "dfax", specifier = ">=0.1.12" },
-    { name = "dfax", extras = ["cuda"], marker = "extra == 'cuda'", specifier = ">=0.1.12" },
+    { name = "dfax", specifier = ">=0.1.13" },
+    { name = "dfax", extras = ["cuda"], marker = "extra == 'cuda'", specifier = ">=0.1.13" },
 ]
 
 [[package]]
 name = "dfax"
-version = "0.1.12"
+version = "0.1.13"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "chex" },
@@ -339,9 +339,9 @@ dependencies = [
     { name = "matplotlib" },
     { name = "networkx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a9/97/e951bd0f67cf7bfd48df9bb7ca70e82c378bef0f283c0bb796a033063083/dfax-0.1.12.tar.gz", hash = "sha256:1a2c16769cde39932989b45a812cdda0c7fa029ead3b552b6b56bb2cca47a129", size = 120756 }
+sdist = { url = "https://files.pythonhosted.org/packages/49/a0/452821aaa734ad81286514ebc8d6df5acc7c89f228bda7804704354e61c0/dfax-0.1.13.tar.gz", hash = "sha256:dd5c085aa278a9de9f79a0b02e1e7e6d95d9ee8c914ea32e2ba3bff6e1183c1e", size = 120757 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d4/8b/8cad2bc61d16e43eafd1d427d321de7b71a53b7f64e386a3096e48dc7b42/dfax-0.1.12-py3-none-any.whl", hash = "sha256:b809ffe00c1aa99fe3874691b6f78872fa1ca901c74c2c572f964796cadd6be3", size = 12211 },
+    { url = "https://files.pythonhosted.org/packages/97/50/9e6f8a18be8fec4d363cf6d5f9523d478955bd4c40b3706a95aa151438e1/dfax-0.1.13-py3-none-any.whl", hash = "sha256:396d3ff0ad8462f435d328e58ad13820818295c1b3eef4ca6af6e7dba3194349", size = 12217 },
 ]
 
 [package.optional-dependencies]
