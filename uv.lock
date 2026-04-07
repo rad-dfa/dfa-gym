@@ -309,7 +309,7 @@ wheels = [
 
 [[package]]
 name = "dfa-gym"
-version = "0.2.4"
+version = "0.2.9"
 source = { editable = "." }
 dependencies = [
     { name = "dfax" },

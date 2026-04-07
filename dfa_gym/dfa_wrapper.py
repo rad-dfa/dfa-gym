@@ -17,6 +17,8 @@ class DFAWrapperState(State):
     init_dfas: Dict[str, dfax.DFAx]
     env_obs: chex.Array
     env_state: State
+    tkn2sym: chex.Array
+    sym2tkn: chex.Array
 
 class DFAWrapper(MultiAgentEnv):
 
@@ -30,6 +32,7 @@ class DFAWrapper(MultiAgentEnv):
         embedder: Callable[[dfax.DFAx], jnp.ndarray] | None = None,
         embedding_dim: int | None = None,
         combine_embed: bool = False,
+        dynamic_alphabet: bool = False
     ) -> None:
         super().__init__(num_agents=env.num_agents)
         self.env = env
@@ -40,9 +43,11 @@ class DFAWrapper(MultiAgentEnv):
         self.embedder = embedder
         self.embedding_dim = embedding_dim
         self.combine_embed = combine_embed
+        self.dynamic_alphabet = dynamic_alphabet
 
         assert (self.embedder is None) == (self.embedding_dim is None)
-        assert self.sampler.n_tokens == self.env.n_tokens
+        assert self.dynamic_alphabet or self.sampler.n_tokens == self.env.n_tokens
+        assert (not self.dynamic_alphabet) or self.sampler.n_tokens <= self.env.n_tokens
 
         self.agents = [f"agent_{i}" for i in range(self.num_agents)]
 
@@ -51,23 +56,41 @@ class DFAWrapper(MultiAgentEnv):
             for agent in self.agents
         }
         max_dfa_size = self.sampler.max_size
-        n_tokens = self.sampler.n_tokens
+        self.n_sym = self.sampler.n_tokens
+        self.n_tkn = self.env.n_tokens
 
         if self.embedder is None:
-            self.observation_spaces = {
-                agent: spaces.Dict({
-                    "_id": spaces.Discrete(self.num_agents),
-                    "obs": self.env.observation_space(agent),
-                    "dfa": spaces.Dict({
-                        "node_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*self.num_agents, 4), dtype=jnp.float32),
-                        "edge_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*self.num_agents*max_dfa_size*self.num_agents, n_tokens + 8), dtype=jnp.float32),
-                        "edge_index": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(2, max_dfa_size*self.num_agents*max_dfa_size*self.num_agents), dtype=jnp.int32),
-                        "current_state": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(self.num_agents,), dtype=jnp.int32),
-                        "n_states": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(max_dfa_size*self.num_agents,), dtype=jnp.int32)
-                    }),
-                })
-                for agent in self.agents
-            }
+            if self.dynamic_alphabet:
+                self.observation_spaces = {
+                    agent: spaces.Dict({
+                        "_id": spaces.Discrete(self.num_agents),
+                        "obs": self.env.observation_space(agent),
+                        "dfa": spaces.Dict({
+                            "node_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*self.num_agents, 4), dtype=jnp.float32),
+                            "edge_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*self.num_agents*max_dfa_size*self.num_agents, self.n_sym + 8), dtype=jnp.float32),
+                            "edge_index": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(2, max_dfa_size*self.num_agents*max_dfa_size*self.num_agents), dtype=jnp.int32),
+                            "current_state": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(self.num_agents,), dtype=jnp.int32),
+                            "n_states": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(max_dfa_size*self.num_agents,), dtype=jnp.int32)
+                        }),
+                        "tkn": spaces.Box(low=0, high=self.n_tkn, shape=(self.n_sym,), dtype=jnp.int32)
+                    })
+                    for agent in self.agents
+                }
+            else:
+                self.observation_spaces = {
+                    agent: spaces.Dict({
+                        "_id": spaces.Discrete(self.num_agents),
+                        "obs": self.env.observation_space(agent),
+                        "dfa": spaces.Dict({
+                            "node_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*self.num_agents, 4), dtype=jnp.float32),
+                            "edge_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*self.num_agents*max_dfa_size*self.num_agents, self.n_sym + 8), dtype=jnp.float32),
+                            "edge_index": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(2, max_dfa_size*self.num_agents*max_dfa_size*self.num_agents), dtype=jnp.int32),
+                            "current_state": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(self.num_agents,), dtype=jnp.int32),
+                            "n_states": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(max_dfa_size*self.num_agents,), dtype=jnp.int32)
+                        }),
+                    })
+                    for agent in self.agents
+                }
         else:
             if self.combine_embed:
                 self.observation_spaces = {
@@ -76,7 +99,7 @@ class DFAWrapper(MultiAgentEnv):
                         "obs": self.env.observation_space(agent),
                         "dfa": spaces.Dict({
                             "node_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*self.num_agents, 4), dtype=jnp.float32),
-                            "edge_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*self.num_agents*max_dfa_size*self.num_agents, n_tokens + 8), dtype=jnp.float32),
+                            "edge_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*self.num_agents*max_dfa_size*self.num_agents, self.n_sym + 8), dtype=jnp.float32),
                             "edge_index": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(2, max_dfa_size*self.num_agents*max_dfa_size*self.num_agents), dtype=jnp.int32),
                             "current_state": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(self.num_agents,), dtype=jnp.int32),
                             "n_states": spaces.Box(low=0, high=max_dfa_size*self.num_agents, shape=(max_dfa_size*self.num_agents,), dtype=jnp.int32)
@@ -100,7 +123,7 @@ class DFAWrapper(MultiAgentEnv):
         self,
         key: chex.PRNGKey
     ) -> Tuple[Dict[str, chex.Array], DFAWrapperState]:
-        keys = jax.random.split(key, 4 + self.num_agents)
+        keys = jax.random.split(key, 5 + self.num_agents)
 
         env_obs, env_state = self.env.reset(keys[1])
 
@@ -114,7 +137,14 @@ class DFAWrapper(MultiAgentEnv):
                 self.sampler.sample(dfa_key)
             )
 
-        dfas_tree = jax.vmap(sample_dfa)(keys[4:], mask)
+        if self.dynamic_alphabet:
+            sym2tkn = jax.random.choice(keys[4], self.n_tkn, shape=(self.n_sym,), replace=False)
+            tkn2sym = (-jnp.ones(self.n_tkn, dtype=jnp.int32)).at[sym2tkn].set(jnp.arange(self.n_sym))
+        else:
+            sym2tkn = jnp.arange(self.n_sym)
+            tkn2sym = (-jnp.ones(self.n_tkn, dtype=jnp.int32)).at[sym2tkn].set(jnp.arange(self.n_sym))
+
+        dfas_tree = jax.vmap(sample_dfa)(keys[5:], mask)
 
         dfas = {
             agent: jax.tree_util.tree_map(lambda x: x[i], dfas_tree)
@@ -125,7 +155,9 @@ class DFAWrapper(MultiAgentEnv):
             dfas=dfas,
             init_dfas={agent: dfas[agent] for agent in self.agents},
             env_obs=env_obs,
-            env_state=env_state
+            env_state=env_state,
+            sym2tkn=sym2tkn,
+            tkn2sym=tkn2sym
         )
         obs = self.get_obs(state=state)
 
@@ -141,10 +173,10 @@ class DFAWrapper(MultiAgentEnv):
 
         env_obs, env_state, env_rewards, env_dones, env_info = self.env.step_env(key, state.env_state, action)
 
-        symbols = self.env.label_f(env_state)
+        tokens = self.env.label_f(env_state)
 
         dfas = {
-            agent: state.dfas[agent].advance(symbols[agent]).minimize()
+            agent: state.dfas[agent].advance(state.tkn2sym[tokens[agent]]).minimize()
             for agent in self.agents
         }
 
@@ -178,7 +210,9 @@ class DFAWrapper(MultiAgentEnv):
             dfas=dfas,
             init_dfas=state.init_dfas,
             env_obs=env_obs,
-            env_state=env_state
+            env_state=env_state,
+            sym2tkn=state.sym2tkn,
+            tkn2sym=state.tkn2sym
         )
 
         obs = self.get_obs(state=state)
@@ -224,6 +258,8 @@ class DFAWrapper(MultiAgentEnv):
                 entry["dfa"] = dfas
             if embs is not None:
                 entry["emb"] = embs
+            if self.dynamic_alphabet:
+                entry["tkn"] = state.sym2tkn
             return entry
 
         return {agent: make_entry(i, agent) for i, agent in enumerate(self.agents)}
