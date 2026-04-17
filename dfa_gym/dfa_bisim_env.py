@@ -65,18 +65,20 @@ class DFABisimEnv(MultiAgentEnv):
     ) -> Tuple[Dict[str, chex.Array], DFABisimState]:
 
         def cond_fn(carry):
-            _, dfa_l, dfa_r = carry
-            return dfa_l == dfa_r
+            _, dfa_l, dfa_r, word = carry
+            return jnp.logical_or(dfa_l == dfa_r, jnp.all(word == -1))
 
         def body_fn(carry):
-            key, _, _ = carry
-            key, kl, kr = jax.random.split(key, 3)
+            key, _, _, _ = carry
+            key, kl, kr, kx = jax.random.split(key, 4)
             dfa_l = self.sampler.sample(kl)
             dfa_r = self.sampler.sample(kr)
-            return (key, dfa_l, dfa_r)
+            dfa_xor = dfa_l ^ dfa_r
+            word = dfa_xor.find_word(kx)
+            return (key, dfa_l, dfa_r, word)
 
-        init_carry = body_fn((key, None, None))
-        _, dfa_l, dfa_r = jax.lax.while_loop(cond_fn, body_fn, init_carry)
+        init_carry = body_fn((key, None, None, None))
+        _, dfa_l, dfa_r, _ = jax.lax.while_loop(cond_fn, body_fn, init_carry)
 
         state = DFABisimState(dfa_l=dfa_l, dfa_r=dfa_r, time=0)
         obs = self.get_obs(state=state)
