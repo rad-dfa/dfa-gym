@@ -106,10 +106,7 @@ class DFABisimEnv(MultiAgentEnv):
             time=state.time+1
         )
 
-        if self.binary_reward:
-            done = jnp.logical_or(dfa_l.n_states <= 1, new_state.time >= self.max_steps_in_episode)
-        else:
-            done = jnp.logical_or(jnp.logical_or(dfa_l.n_states <= 1, dfa_r.n_states <= 1), new_state.time >= self.max_steps_in_episode)
+        done = jnp.logical_or(jnp.logical_or(reward_l != 0, reward_r != 0), new_state.time >= self.max_steps_in_episode)
 
         obs = self.get_obs(state=new_state)
         info = {}
