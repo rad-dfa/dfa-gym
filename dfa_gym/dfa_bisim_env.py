@@ -21,12 +21,14 @@ class DFABisimEnv(MultiAgentEnv):
     def __init__(
         self,
         sampler: DFASampler = RADSampler(),
-        max_steps_in_episode: int = 100
+        max_steps_in_episode: int = 100,
+        binary_reward: bool = True,
     ) -> None:
         super().__init__(num_agents=1)
         self.n_agents = self.num_agents
         self.sampler = sampler
         self.max_steps_in_episode = max_steps_in_episode
+        self.binary_reward = binary_reward
 
         self.agents = [f"agent_{i}" for i in range(self.n_agents)]
 
@@ -92,8 +94,8 @@ class DFABisimEnv(MultiAgentEnv):
         dfa_l = state.dfa_l.advance(action[self.agents[0]]).minimize()
         dfa_r = state.dfa_r.advance(action[self.agents[0]]).minimize()
 
-        reward_l = dfa_l.reward(binary=False)
-        reward_r = dfa_r.reward(binary=False)
+        reward_l = dfa_l.reward(binary=self.binary_reward)
+        reward_r = dfa_r.reward(binary=self.binary_reward)
         reward = reward_l - reward_r
 
         new_state = DFABisimState(

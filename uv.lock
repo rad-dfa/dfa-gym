@@ -309,7 +309,7 @@ wheels = [
 
 [[package]]
 name = "dfa-gym"
-version = "0.2.13"
+version = "0.2.15"
 source = { editable = "." }
 dependencies = [
     { name = "dfax" },
@@ -322,13 +322,13 @@ cuda = [
 
 [package.metadata]
 requires-dist = [
-    { name = "dfax", specifier = ">=0.1.13" },
-    { name = "dfax", extras = ["cuda"], marker = "extra == 'cuda'", specifier = ">=0.1.13" },
+    { name = "dfax", specifier = ">=0.1.16" },
+    { name = "dfax", extras = ["cuda"], marker = "extra == 'cuda'", specifier = ">=0.1.16" },
 ]
 
 [[package]]
 name = "dfax"
-version = "0.1.13"
+version = "0.1.16"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "chex" },
@@ -339,9 +339,9 @@ dependencies = [
     { name = "matplotlib" },
     { name = "networkx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/49/a0/452821aaa734ad81286514ebc8d6df5acc7c89f228bda7804704354e61c0/dfax-0.1.13.tar.gz", hash = "sha256:dd5c085aa278a9de9f79a0b02e1e7e6d95d9ee8c914ea32e2ba3bff6e1183c1e", size = 120757 }
+sdist = { url = "https://files.pythonhosted.org/packages/9e/76/ce1bf7b56a7b0d27f325312922fd0280389c0597abb07eb698cbdd2d0cdf/dfax-0.1.16.tar.gz", hash = "sha256:acb8d03056f6639ad0cb7ece216f5c8e55e8b333b59e76adbf69af707b74f0be", size = 694404 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/97/50/9e6f8a18be8fec4d363cf6d5f9523d478955bd4c40b3706a95aa151438e1/dfax-0.1.13-py3-none-any.whl", hash = "sha256:396d3ff0ad8462f435d328e58ad13820818295c1b3eef4ca6af6e7dba3194349", size = 12217 },
+    { url = "https://files.pythonhosted.org/packages/8e/b8/56cec76a804ebb69b93b277e23d15ca1d35cec4c1453621603840d308c02/dfax-0.1.16-py3-none-any.whl", hash = "sha256:d6415e31350c4718675cfe535d35f29aa491ca49b88019f87ec191076dc5811e", size = 600218 },
 ]
 
 [package.optional-dependencies]
@@ -1115,7 +1115,11 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "nvidia-cuda-nvrtc-cu12" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/04/1b/54f7595727516ba21b59dd8607ade5e6dda973462264be9af74b5ee0dee3/nvidia_cublas_cu12-12.9.2.10.tar.gz", hash = "sha256:7caf6512c921f956e5e609378e8332be502d7e5108deaade5c7ecf6b8042e842", size = 15431 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f7/a2/c96163a0fff1839c0c9548bbdeae7b853b867009e33b9b9264adc238b1cf/nvidia_cublas_cu12-12.9.2.10-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:5572131a59c3eebeeb1c4c8144f772d49372c20124916e072a0e3fc30df421d5", size = 575012079 },
+    { url = "https://files.pythonhosted.org/packages/cb/c0/0a517bfe63ccd3b92eb254d264e28fca3c7cab75d07daea315250fb1bf73/nvidia_cublas_cu12-12.9.2.10-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:e4f53a8ca8c5d6e8c492d0d0a3d565ecb59a751b19cfdaa4f6da0ab2104c1702", size = 581240110 },
+    { url = "https://files.pythonhosted.org/packages/20/e2/fc9a0e985249d873150276d5afb02e39a66817fedbf1a385724393e505ed/nvidia_cublas_cu12-12.9.2.10-py3-none-win_amd64.whl", hash = "sha256:623f43027d40d44ceadf0043f002bd25cf353e8f13ce90b9a87057019f560661", size = 553162896 },
+]
 
 [[package]]
 name = "nvidia-cuda-cupti-cu12"
