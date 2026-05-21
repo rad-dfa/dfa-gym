@@ -23,12 +23,14 @@ class DFABisimEnv(MultiAgentEnv):
         sampler: DFASampler = RADSampler(),
         max_steps_in_episode: int = 100,
         binary_reward: bool = True,
+        with_examples: bool = False,
     ) -> None:
         super().__init__(num_agents=1)
         self.n_agents = self.num_agents
         self.sampler = sampler
         self.max_steps_in_episode = max_steps_in_episode
         self.binary_reward = binary_reward
+        self.with_examples = with_examples
 
         self.agents = [f"agent_{i}" for i in range(self.n_agents)]
 
@@ -38,25 +40,41 @@ class DFABisimEnv(MultiAgentEnv):
         }
         max_dfa_size = self.sampler.max_size
         n_tokens = self.sampler.n_tokens
-        self.observation_spaces = {
-            agent: spaces.Dict({
-                "graph_l": spaces.Dict({
-                    "node_features": spaces.Box(low=0, high=1, shape=(max_dfa_size, 4), dtype=jnp.uint16),
-                    "edge_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*max_dfa_size, n_tokens + 8), dtype=jnp.uint16),
-                    "edge_index": spaces.Box(low=0, high=max_dfa_size, shape=(2, max_dfa_size*max_dfa_size), dtype=jnp.uint16),
-                    "current_state": spaces.Box(low=0, high=max_dfa_size, shape=(1,), dtype=jnp.uint16),
-                    "n_states": spaces.Box(low=0, high=max_dfa_size, shape=(max_dfa_size,), dtype=jnp.uint16)
-                }),
-                "graph_r": spaces.Dict({
-                    "node_features": spaces.Box(low=0, high=1, shape=(max_dfa_size, 4), dtype=jnp.uint16),
-                    "edge_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*max_dfa_size, n_tokens + 8), dtype=jnp.uint16),
-                    "edge_index": spaces.Box(low=0, high=max_dfa_size, shape=(2, max_dfa_size*max_dfa_size), dtype=jnp.uint16),
-                    "current_state": spaces.Box(low=0, high=max_dfa_size, shape=(1,), dtype=jnp.uint16),
-                    "n_states": spaces.Box(low=0, high=max_dfa_size, shape=(max_dfa_size,), dtype=jnp.uint16)
+        if self.with_examples:
+            self.observation_spaces = {
+                agent: spaces.Dict({
+                    "graph_l": spaces.Dict({
+                        "node_features": spaces.Box(low=0, high=1, shape=(max_dfa_size, 4), dtype=jnp.uint16),
+                        "edge_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*max_dfa_size, n_tokens + 8), dtype=jnp.uint16),
+                        "edge_index": spaces.Box(low=0, high=max_dfa_size, shape=(2, max_dfa_size*max_dfa_size), dtype=jnp.uint16),
+                        "current_state": spaces.Box(low=0, high=max_dfa_size, shape=(1,), dtype=jnp.uint16),
+                        "n_states": spaces.Box(low=0, high=max_dfa_size, shape=(max_dfa_size,), dtype=jnp.uint16)
+                    }),
+                    "pos_r": spaces.Box(low=-1, high=n_tokens, shape=(10, 10), dtype=jnp.int16),
+                    "neg_r": spaces.Box(low=-1, high=n_tokens, shape=(10, 10), dtype=jnp.int16),
                 })
-            })
-            for agent in self.agents
-        }
+                for agent in self.agents
+            }
+        else:
+            self.observation_spaces = {
+                agent: spaces.Dict({
+                    "graph_l": spaces.Dict({
+                        "node_features": spaces.Box(low=0, high=1, shape=(max_dfa_size, 4), dtype=jnp.uint16),
+                        "edge_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*max_dfa_size, n_tokens + 8), dtype=jnp.uint16),
+                        "edge_index": spaces.Box(low=0, high=max_dfa_size, shape=(2, max_dfa_size*max_dfa_size), dtype=jnp.uint16),
+                        "current_state": spaces.Box(low=0, high=max_dfa_size, shape=(1,), dtype=jnp.uint16),
+                        "n_states": spaces.Box(low=0, high=max_dfa_size, shape=(max_dfa_size,), dtype=jnp.uint16)
+                    }),
+                    "graph_r": spaces.Dict({
+                        "node_features": spaces.Box(low=0, high=1, shape=(max_dfa_size, 4), dtype=jnp.uint16),
+                        "edge_features": spaces.Box(low=0, high=1, shape=(max_dfa_size*max_dfa_size, n_tokens + 8), dtype=jnp.uint16),
+                        "edge_index": spaces.Box(low=0, high=max_dfa_size, shape=(2, max_dfa_size*max_dfa_size), dtype=jnp.uint16),
+                        "current_state": spaces.Box(low=0, high=max_dfa_size, shape=(1,), dtype=jnp.uint16),
+                        "n_states": spaces.Box(low=0, high=max_dfa_size, shape=(max_dfa_size,), dtype=jnp.uint16)
+                    })
+                })
+                for agent in self.agents
+            }
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(
@@ -118,6 +136,13 @@ class DFABisimEnv(MultiAgentEnv):
         self,
         state: DFABisimState
     ) -> Dict[str, chex.Array]:
+        if self.with_examples:
+            pos_r, neg_r = state.dfa_r.language(n=10, k=10)
+            return {
+                "graph_l": state.dfa_l.to_graph(),
+                "pos_r": pos_r,
+                "neg_r": neg_r
+            }
         return {
             "graph_l": state.dfa_l.to_graph(),
             "graph_r": state.dfa_r.to_graph()
