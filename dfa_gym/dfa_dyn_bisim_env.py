@@ -14,6 +14,7 @@ from dfax.samplers import DFASampler, RADSampler
 class DFADynBisimState(State):
     dfa_l: dfax.DFAx
     dfa_r: dfax.DFAx
+    sym2evt: chex.Array
     evt2sym: chex.Array
     time: int
 
@@ -58,7 +59,7 @@ class DFADynBisimEnv(MultiAgentEnv):
                     "current_state": spaces.Box(low=0, high=max_dfa_size, shape=(1,), dtype=jnp.uint16),
                     "n_states": spaces.Box(low=0, high=max_dfa_size, shape=(max_dfa_size,), dtype=jnp.uint16)
                 }),
-                "evt2sym": spaces.Box(low=0, high=1, shape=(n_tokens, n_events), dtype=jnp.float32)
+                "sym2evt": spaces.Box(low=0, high=n_events, shape=(n_tokens,), dtype=jnp.int32)
             })
             for agent in self.agents
         }
@@ -86,10 +87,11 @@ class DFADynBisimEnv(MultiAgentEnv):
         key, dfa_l, dfa_r, _ = jax.lax.while_loop(cond_fn, body_fn, init_carry)
 
         key, subkey = jax.random.split(key)
-        symbols = jax.random.randint(subkey, shape=(self.n_events,), minval=0, maxval=self.sampler.n_tokens)
-        evt2sym = jax.nn.one_hot(symbols, self.sampler.n_tokens, dtype=jnp.float32).T
+        n_tokens = self.sampler.n_tokens
+        sym2evt = jax.random.choice(subkey, self.n_events, shape=(n_tokens,), replace=False).astype(jnp.int32)
+        evt2sym = (-jnp.ones(self.n_events, dtype=jnp.int32)).at[sym2evt].set(jnp.arange(n_tokens, dtype=jnp.int32))
 
-        state = DFADynBisimState(dfa_l=dfa_l, dfa_r=dfa_r, evt2sym=evt2sym, time=0)
+        state = DFADynBisimState(dfa_l=dfa_l, dfa_r=dfa_r, sym2evt=sym2evt, evt2sym=evt2sym, time=0)
         obs = self.get_obs(state=state)
 
         return {self.agents[0]: obs}, state
@@ -103,10 +105,12 @@ class DFADynBisimEnv(MultiAgentEnv):
     ) -> Tuple[Dict[str, chex.Array], DFADynBisimState, Dict[str, float], Dict[str, bool], Dict]:
 
         event = action[self.agents[0]]
-        symbol = jnp.argmax(state.evt2sym[:, event])
+        symbol = state.evt2sym[event]
 
-        dfa_l = state.dfa_l.advance(symbol).minimize()
-        dfa_r = state.dfa_r.advance(symbol).minimize()
+        adv_l = state.dfa_l.advance(symbol).minimize()
+        adv_r = state.dfa_r.advance(symbol).minimize()
+        dfa_l = jax.tree_util.tree_map(lambda a, b: jnp.where(symbol >= 0, a, b), adv_l, state.dfa_l)
+        dfa_r = jax.tree_util.tree_map(lambda a, b: jnp.where(symbol >= 0, a, b), adv_r, state.dfa_r)
 
         reward_l = dfa_l.reward(binary=self.binary_reward)
         reward_r = dfa_r.reward(binary=self.binary_reward)
@@ -115,6 +119,7 @@ class DFADynBisimEnv(MultiAgentEnv):
         new_state = DFADynBisimState(
             dfa_l=dfa_l,
             dfa_r=dfa_r,
+            sym2evt=state.sym2evt,
             evt2sym=state.evt2sym,
             time=state.time+1
         )
@@ -134,5 +139,5 @@ class DFADynBisimEnv(MultiAgentEnv):
         return {
             "graph_l": state.dfa_l.to_graph(),
             "graph_r": state.dfa_r.to_graph(),
-            "evt2sym": state.evt2sym
+            "sym2evt": state.sym2evt
         }

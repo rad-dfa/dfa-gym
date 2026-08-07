@@ -22,10 +22,14 @@ def test(env, n=100, seed=42):
 
             action = actions[env.agents[0]]
             if hasattr(state, "evt2sym"):
-                action = jnp.argmax(state.evt2sym[:, action])
-
-            expected_l = state.dfa_l.advance(action).minimize()
-            expected_r = state.dfa_r.advance(action).minimize()
+                symbol = state.evt2sym[action]
+                adv_l = state.dfa_l.advance(symbol).minimize()
+                adv_r = state.dfa_r.advance(symbol).minimize()
+                expected_l = jax.tree_util.tree_map(lambda a, b: jnp.where(symbol >= 0, a, b), adv_l, state.dfa_l)
+                expected_r = jax.tree_util.tree_map(lambda a, b: jnp.where(symbol >= 0, a, b), adv_r, state.dfa_r)
+            else:
+                expected_l = state.dfa_l.advance(action).minimize()
+                expected_r = state.dfa_r.advance(action).minimize()
             assert expected_l == new_state.dfa_l
             assert expected_r == new_state.dfa_r
 
@@ -53,3 +57,4 @@ if __name__ == '__main__':
 
     test(DFABisimEnv())
     test(DFADynBisimEnv())
+    test(DFADynBisimEnv(n_events=12))
