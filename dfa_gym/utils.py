@@ -1,9 +1,11 @@
 import re
+import itertools
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import matplotlib.patches as patches
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 from matplotlib.animation import FuncAnimation, PillowWriter
+from mpl_toolkits.mplot3d import Axes3D
 
 
 def parse_map(map_lines):
@@ -214,6 +216,65 @@ def visualize(layout, figsize, cell_size=1, save_path=None, trace=None):
         else:
             plt.show()
         plt.close()
+
+
+def _draw_bounds(ax, low, high):
+    """Draws the wireframe of a DroneEnv's bounding box and sets the axis limits to it."""
+    low, high = low.tolist(), high.tolist()
+    corners = list(itertools.product(*zip(low, high)))
+    for a, b in itertools.combinations(corners, 2):
+        if sum(u != v for u, v in zip(a, b)) == 1:
+            ax.plot(*zip(a, b), color="gray", lw=0.5, ls="--")
+    ax.set_xlim(low[0], high[0])
+    ax.set_ylim(low[1], high[1])
+    ax.set_zlim(low[2], high[2])
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+
+
+def visualize_drone_state(env, state, save_path=None):
+    """Plots a DroneEnv state: agent positions within the environment's bounding box."""
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(projection="3d")
+    _draw_bounds(ax, env.low, env.high)
+
+    xs, ys, zs = state.positions[:, 0].tolist(), state.positions[:, 1].tolist(), state.positions[:, 2].tolist()
+    ax.scatter(xs, ys, zs, s=80, c="crimson")
+    for i, (x, y, z) in enumerate(zip(xs, ys, zs)):
+        ax.text(x, y, z, str(i), weight="bold")
+
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight", dpi=300)
+        plt.close(fig)
+    else:
+        plt.show()
+        plt.close(fig)
+
+
+def animate_drone_trace(env, trace, save_path, fps=10):
+    """Animates a DroneEnv trace (a list of DroneEnvState) as a GIF of agent trajectories."""
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(projection="3d")
+    _draw_bounds(ax, env.low, env.high)
+
+    positions = [s.positions.tolist() for s in trace]
+    n_agents = len(positions[0])
+    scat = ax.scatter([], [], [], s=80, c="crimson")
+    lines = [ax.plot([], [], [], lw=1, color=f"C{i % 10}")[0] for i in range(n_agents)]
+
+    def update(frame):
+        scat._offsets3d = tuple(zip(*positions[frame]))
+        for i, line in enumerate(lines):
+            hx, hy, hz = zip(*(positions[t][i] for t in range(frame + 1)))
+            line.set_data(hx, hy)
+            line.set_3d_properties(hz)
+        ax.set_title(f"Time step: {frame}")
+        return [scat, *lines]
+
+    anim = FuncAnimation(fig, update, frames=len(trace), interval=1000 / fps, blit=False)
+    anim.save(save_path, writer=PillowWriter(fps=fps))
+    plt.close(fig)
 
 
 if __name__ == "__main__":
