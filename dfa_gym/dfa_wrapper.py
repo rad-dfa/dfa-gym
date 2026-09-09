@@ -48,6 +48,8 @@ class DFAWrapper(MultiAgentEnv):
         assert (self.embedder is None) == (self.embedding_dim is None)
         assert self.dynamic_alphabet or (self.sampler.n_tokens == self.env.n_tokens)
         assert (not self.dynamic_alphabet) or ((self.sampler.n_tokens <= self.env.n_tokens) and (self.embedder is None))
+        assert hasattr(self.env, "label_f") and callable(self.env.label_f), \
+            f"{type(self.env).__name__} passed to DFAWrapper must implement a `label_f(state) -> Dict[str, int]` method"
 
         self.agents = [f"agent_{i}" for i in range(self.num_agents)]
 
