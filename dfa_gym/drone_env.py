@@ -69,7 +69,7 @@ class DroneEnv(MultiAgentEnv):
         self,
         key: chex.PRNGKey
     ) -> Tuple[Dict[str, chex.Array], DroneEnvState]:
-        positions = jax.random.uniform(key, shape=(self.n_agents, 3), minval=self.low, maxval=self.high)
+        positions = jnp.zeros((self.n_agents, 3), dtype=jnp.float32)
         velocities = jnp.zeros((self.n_agents, 3), dtype=jnp.float32)
         state = DroneEnvState(positions=positions, velocities=velocities, time=0)
         return self.get_obs(state=state), state
@@ -109,3 +109,68 @@ class DroneEnv(MultiAgentEnv):
             agent: jnp.concatenate([state.positions[i], state.velocities[i]])
             for i, agent in enumerate(self.agents)
         }
+
+    def label_regions(self):
+        """Geometry of the regions labeled by `label_f`; also used to draw them.
+
+        Every region is a 1.0-tall (z) prism, inset so it lies fully inside
+        [low, high]. Returns a list of (token, kind, params) tuples in label-priority
+        order (an earlier entry wins any overlap): kind "circle" -> params
+        (cx, cy, r, z_lo, z_hi); kind "rect" -> params (x_lo, x_hi, y_lo, y_hi, z_lo, z_hi).
+        0: center, 1: corners, 2: edge midpoints, 3: corner<->midpoint corridors on
+        the vertical (left/right) edges, 4: same but on the horizontal (top/bottom) edges.
+        """
+        x_low, y_low = self.low[0], self.low[1]
+        x_high, y_high = self.high[0], self.high[1]
+        x_mid = 0.5 * (x_low + x_high)
+        y_mid = 0.5 * (y_low + y_high)
+        r = 0.1 * jnp.minimum(x_high - x_low, y_high - y_low)
+
+        z_mid = 0.5 * (self.low[2] + self.high[2])
+        z_lo, z_hi = z_mid - 0.75, z_mid + 0.25
+
+        # Corner/edge-midpoint circles are inset by r so they sit fully inside [low, high]
+        # instead of being centered on the boundary itself.
+        x_lo_in, x_hi_in = x_low + r, x_high - r
+        y_lo_in, y_hi_in = y_low + r, y_high - r
+
+        corners = [(x_lo_in, y_lo_in), (x_lo_in, y_hi_in), (x_hi_in, y_lo_in), (x_hi_in, y_hi_in)]
+        edge_mids = [(x_mid, y_lo_in), (x_mid, y_hi_in), (x_lo_in, y_mid), (x_hi_in, y_mid)]
+        vert_edges = [
+            (x_low, x_low + 2 * r, y_low + 2 * r, y_mid - r),
+            (x_low, x_low + 2 * r, y_mid + r, y_high - 2 * r),
+            (x_high - 2 * r, x_high, y_low + 2 * r, y_mid - r),
+            (x_high - 2 * r, x_high, y_mid + r, y_high - 2 * r),
+        ]
+        horiz_edges = [
+            (x_low + 2 * r, x_mid - r, y_low, y_low + 2 * r),
+            (x_mid + r, x_high - 2 * r, y_low, y_low + 2 * r),
+            (x_low + 2 * r, x_mid - r, y_high - 2 * r, y_high),
+            (x_mid + r, x_high - 2 * r, y_high - 2 * r, y_high),
+        ]
+
+        regions = [(0, "circle", (x_mid, y_mid, r * 2, z_hi, z_hi + 0.25))]
+        regions += [(1, "circle", (cx, cy, r, z_lo, z_hi)) for cx, cy in corners]
+        regions += [(2, "circle", (mx, my, r, z_lo, z_hi)) for mx, my in edge_mids]
+        regions += [(3, "rect", bounds + (z_lo, z_hi)) for bounds in vert_edges]
+        regions += [(4, "rect", bounds + (z_lo, z_hi)) for bounds in horiz_edges]
+        return regions
+
+    @partial(jax.jit, static_argnums=(0,))
+    def label_f(
+        self,
+        state: DroneEnvState
+    ) -> Dict[str, int]:
+        # Labels the agent's full (x, y, z) position -- each region is a 1.0-tall prism.
+        x, y, z = state.positions[:, 0], state.positions[:, 1], state.positions[:, 2]
+        labels = jnp.full(x.shape, -1, dtype=jnp.int32)
+        for token, kind, params in reversed(self.label_regions()):
+            if kind == "circle":
+                cx, cy, r, z_lo, z_hi = params
+                mask = ((x - cx) ** 2 + (y - cy) ** 2 <= r ** 2) & (z >= z_lo) & (z <= z_hi)
+            else:
+                x_lo, x_hi, y_lo, y_hi, z_lo, z_hi = params
+                mask = (x >= x_lo) & (x <= x_hi) & (y >= y_lo) & (y <= y_hi) & (z >= z_lo) & (z <= z_hi)
+            labels = jnp.where(mask, token, labels)
+
+        return {agent: labels[i] for i, agent in enumerate(self.agents)}

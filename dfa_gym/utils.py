@@ -1,11 +1,12 @@
 import re
+import math
 import itertools
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import matplotlib.patches as patches
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 from matplotlib.animation import FuncAnimation, PillowWriter
-from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d import Axes3D, art3d
 
 
 def parse_map(map_lines):
@@ -233,11 +234,60 @@ def _draw_bounds(ax, low, high):
     ax.set_zlabel("z")
 
 
+DRONE_LABEL_COLORS = {
+    0: "orchid",
+    1: "cornflowerblue",
+    2: "yellowgreen",
+    3: "sandybrown",
+    4: "indianred",
+}
+
+
+def _cylinder_faces(cx, cy, r, z_lo, z_hi, n=20):
+    """Side + cap quad/n-gon faces (each a list of (x, y, z) vertices) of a vertical cylinder."""
+    ring = [(cx + r * math.cos(2 * math.pi * i / n), cy + r * math.sin(2 * math.pi * i / n)) for i in range(n)]
+    faces = []
+    for (x0, y0), (x1, y1) in zip(ring, ring[1:] + ring[:1]):
+        faces.append([(x0, y0, z_lo), (x1, y1, z_lo), (x1, y1, z_hi), (x0, y0, z_hi)])
+    faces.append([(x, y, z_lo) for x, y in ring])
+    faces.append([(x, y, z_hi) for x, y in ring])
+    return faces
+
+
+def _box_faces(x_lo, x_hi, y_lo, y_hi, z_lo, z_hi):
+    """The 6 quad faces (each a list of (x, y, z) vertices) of an axis-aligned box."""
+    return [
+        [(x_lo, y_lo, z_lo), (x_hi, y_lo, z_lo), (x_hi, y_hi, z_lo), (x_lo, y_hi, z_lo)],  # bottom
+        [(x_lo, y_lo, z_hi), (x_hi, y_lo, z_hi), (x_hi, y_hi, z_hi), (x_lo, y_hi, z_hi)],  # top
+        [(x_lo, y_lo, z_lo), (x_hi, y_lo, z_lo), (x_hi, y_lo, z_hi), (x_lo, y_lo, z_hi)],  # y = y_lo
+        [(x_lo, y_hi, z_lo), (x_hi, y_hi, z_lo), (x_hi, y_hi, z_hi), (x_lo, y_hi, z_hi)],  # y = y_hi
+        [(x_lo, y_lo, z_lo), (x_lo, y_hi, z_lo), (x_lo, y_hi, z_hi), (x_lo, y_lo, z_hi)],  # x = x_lo
+        [(x_hi, y_lo, z_lo), (x_hi, y_hi, z_lo), (x_hi, y_hi, z_hi), (x_hi, y_lo, z_hi)],  # x = x_hi
+    ]
+
+
+def _draw_label_regions(ax, env, alpha=0.35):
+    """Draws `env.label_f`'s regions as translucent 3D prisms (cylinder or box, 1.0 tall)."""
+    for token, kind, params in env.label_regions():
+        color = DRONE_LABEL_COLORS.get(token, "gray")
+        if kind == "circle":
+            cx, cy, r, z_lo, z_hi = (float(v) for v in params)
+            faces = _cylinder_faces(cx, cy, r, z_lo, z_hi)
+        else:
+            x_lo, x_hi, y_lo, y_hi, z_lo, z_hi = (float(v) for v in params)
+            faces = _box_faces(x_lo, x_hi, y_lo, y_hi, z_lo, z_hi)
+        ax.add_collection3d(art3d.Poly3DCollection(faces, facecolor=color, edgecolor="none", alpha=alpha))
+
+    handles = [patches.Patch(color=c, alpha=alpha, label=f"token {t}") for t, c in DRONE_LABEL_COLORS.items()]
+    ax.legend(handles=handles, loc="upper left", fontsize=7, framealpha=0.6)
+
+
 def visualize_drone_state(env, state, save_path=None):
     """Plots a DroneEnv state: agent positions within the environment's bounding box."""
     fig = plt.figure(figsize=(6, 6))
     ax = fig.add_subplot(projection="3d")
     _draw_bounds(ax, env.low, env.high)
+    _draw_label_regions(ax, env)
 
     xs, ys, zs = state.positions[:, 0].tolist(), state.positions[:, 1].tolist(), state.positions[:, 2].tolist()
     ax.scatter(xs, ys, zs, s=80, c="crimson")
@@ -257,6 +307,7 @@ def animate_drone_trace(env, trace, save_path, fps=10):
     fig = plt.figure(figsize=(6, 6))
     ax = fig.add_subplot(projection="3d")
     _draw_bounds(ax, env.low, env.high)
+    _draw_label_regions(ax, env)
 
     positions = [s.positions.tolist() for s in trace]
     n_agents = len(positions[0])
