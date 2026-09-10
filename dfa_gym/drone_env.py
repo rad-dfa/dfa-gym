@@ -49,6 +49,7 @@ class DroneEnv(MultiAgentEnv):
         self.max_action = max_speed if not use_displacement_action else max_speed * dt
 
         self.agents = [f"agent_{i}" for i in range(self.n_agents)]
+        self.n_tokens = len(set(token for token, _, _ in self.label_regions()))
 
         self.action_spaces = {
             agent: spaces.Box(low=-self.max_action, high=self.max_action, shape=(3,), dtype=jnp.float32)
