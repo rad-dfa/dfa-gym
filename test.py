@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from dfa_gym import DFABisimEnv, DFADynBisimEnv
+from dfa_gym import DFABisimEnv, DFADynBisimEnv, DFAWrapper, TokenEnv
 
 def test(env, n=100, seed=42):
 
@@ -49,7 +49,26 @@ def test(env, n=100, seed=42):
     print(f"Test completed for {n} samples.")
 
 
+def test_dfa_wrapper_requires_label_f():
+
+    print("Running test for DFAWrapper's label_f requirement.")
+
+    DFAWrapper(env=TokenEnv())
+
+    class EnvWithoutLabelF:
+        def __init__(self, num_agents, n_tokens):
+            self.num_agents = num_agents
+            self.n_tokens = n_tokens
+
+    try:
+        DFAWrapper(env=EnvWithoutLabelF(num_agents=3, n_tokens=10))
+        raise RuntimeError("Expected AssertionError for env missing label_f.")
+    except AssertionError:
+        print("Test completed.")
+
+
 if __name__ == '__main__':
 
     test(DFABisimEnv())
     test(DFADynBisimEnv())
+    test_dfa_wrapper_requires_label_f()
