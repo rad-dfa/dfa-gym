@@ -234,12 +234,18 @@ def _draw_bounds(ax, low, high):
     ax.set_zlabel("z")
 
 
+# Corridor tokens 2-9 come in one light/dark hue pair per corner (see DroneEnv.label_regions).
 DRONE_LABEL_COLORS = {
-    0: "orchid",
-    1: "cornflowerblue",
-    2: "yellowgreen",
-    3: "sandybrown",
-    4: "indianred",
+    0: "cornflowerblue",
+    1: "yellowgreen",
+    2: "sandybrown",
+    3: "saddlebrown",
+    4: "lightcoral",
+    5: "firebrick",
+    6: "plum",
+    7: "darkorchid",
+    8: "khaki",
+    9: "darkgoldenrod",
 }
 
 

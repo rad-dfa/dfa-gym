@@ -118,8 +118,10 @@ class DroneEnv(MultiAgentEnv):
         [low, high]. Returns a list of (token, kind, params) tuples in label-priority
         order (an earlier entry wins any overlap): kind "circle" -> params
         (cx, cy, r, z_lo, z_hi); kind "rect" -> params (x_lo, x_hi, y_lo, y_hi, z_lo, z_hi).
-        0: center, 1: corners, 2: edge midpoints, 3: corner<->midpoint corridors on
-        the vertical (left/right) edges, 4: same but on the horizontal (top/bottom) edges.
+        0: corners, 1: edge midpoints, 2-9: the corner<->midpoint corridors, each with
+        its own token -- corner k's corridor along the vertical (left/right) edge is 2 + 2k
+        and along the horizontal (top/bottom) edge is 3 + 2k, with corners k ordered
+        (x_low, y_low), (x_low, y_high), (x_high, y_low), (x_high, y_high).
         """
         x_low, y_low = self.low[0], self.low[1]
         x_high, y_high = self.high[0], self.high[1]
@@ -137,24 +139,21 @@ class DroneEnv(MultiAgentEnv):
 
         corners = [(x_lo_in, y_lo_in), (x_lo_in, y_hi_in), (x_hi_in, y_lo_in), (x_hi_in, y_hi_in)]
         edge_mids = [(x_mid, y_lo_in), (x_mid, y_hi_in), (x_lo_in, y_mid), (x_hi_in, y_mid)]
-        vert_edges = [
+        # The vertical-edge then horizontal-edge corridor of each corner, in `corners` order.
+        corner_rects = [
             (x_low, x_low + 2 * r, y_low + 2 * r, y_mid - r),
-            (x_low, x_low + 2 * r, y_mid + r, y_high - 2 * r),
-            (x_high - 2 * r, x_high, y_low + 2 * r, y_mid - r),
-            (x_high - 2 * r, x_high, y_mid + r, y_high - 2 * r),
-        ]
-        horiz_edges = [
             (x_low + 2 * r, x_mid - r, y_low, y_low + 2 * r),
-            (x_mid + r, x_high - 2 * r, y_low, y_low + 2 * r),
+            (x_low, x_low + 2 * r, y_mid + r, y_high - 2 * r),
             (x_low + 2 * r, x_mid - r, y_high - 2 * r, y_high),
+            (x_high - 2 * r, x_high, y_low + 2 * r, y_mid - r),
+            (x_mid + r, x_high - 2 * r, y_low, y_low + 2 * r),
+            (x_high - 2 * r, x_high, y_mid + r, y_high - 2 * r),
             (x_mid + r, x_high - 2 * r, y_high - 2 * r, y_high),
         ]
 
-        regions = [(0, "circle", (x_mid, y_mid, r * 2, z_hi, z_hi + 0.25))]
-        regions += [(1, "circle", (cx, cy, r, z_lo, z_hi)) for cx, cy in corners]
-        regions += [(2, "circle", (mx, my, r, z_lo, z_hi)) for mx, my in edge_mids]
-        regions += [(3, "rect", bounds + (z_lo, z_hi)) for bounds in vert_edges]
-        regions += [(4, "rect", bounds + (z_lo, z_hi)) for bounds in horiz_edges]
+        regions = [(0, "circle", (cx, cy, r, z_lo, z_hi)) for cx, cy in corners]
+        regions += [(1, "circle", (mx, my, r, z_lo, z_hi)) for mx, my in edge_mids]
+        regions += [(2 + i, "rect", bounds + (z_lo, z_hi)) for i, bounds in enumerate(corner_rects)]
         return regions
 
     @partial(jax.jit, static_argnums=(0,))
