@@ -3,8 +3,20 @@
 Action is a per-agent 3D velocity command (default) or, if
 `use_displacement_action=True`, a direct 3D position-delta ("distance
 change") command. No reward/goal is defined here; wrap or subclass for that.
+
+If `use_velocity_filter=True`, velocity commands instead go through the deployed
+drone's velocity filter: the action is normalized to [-1, 1] and scaled by
+`max_speed` into a target velocity, which is held for the whole policy step `dt`,
+split into ceil(dt / filter_dt) substeps, in each of which the acceleration
+follows a critically-damped second-order law toward the target (vector-norm
+limited to `max_filter_accel`) and is integrated into velocity and position.
+Deployment equivalents: dt = POLICY_DT, filter_dt = FILTER_DT,
+velocity_filter_tau = TAU (dfa_velocity_filter_tau_s), max_filter_accel =
+MAX_ACCEL (dfa_max_filter_acceleration_mps2), max_speed = VELOCITY_SCALE
+(dfa_velocity_scale).
 """
 import jax
+import math
 import chex
 import jax.numpy as jnp
 from flax import struct
@@ -18,6 +30,7 @@ from dfa_gym.env import MultiAgentEnv, State
 class DroneEnvState(State):
     positions: jax.Array
     velocities: jax.Array
+    accelerations: jax.Array  # Velocity filter state; stays zero when the filter is off.
     time: int
 
 class DroneEnv(MultiAgentEnv):
@@ -34,8 +47,13 @@ class DroneEnv(MultiAgentEnv):
         max_speed: float = 1.0,
         dt: float = 0.1,
         use_displacement_action: bool = False,
+        use_velocity_filter: bool = False,
+        velocity_filter_tau: float = 0.1,
+        max_filter_accel: float = 3.0,
+        filter_dt: float = 0.005,
         max_steps_in_episode: int = 200,
     ) -> None:
+        assert not (use_displacement_action and use_velocity_filter), "the velocity filter only applies to velocity actions"
         super().__init__(num_agents=n_agents)
         self.n_agents = n_agents
         self.low = jnp.array([x_low, y_low, z_low], dtype=jnp.float32)
@@ -43,10 +61,19 @@ class DroneEnv(MultiAgentEnv):
         self.max_speed = max_speed
         self.dt = dt
         self.use_displacement_action = use_displacement_action
+        self.use_velocity_filter = use_velocity_filter
+        self.velocity_filter_tau = velocity_filter_tau
+        self.max_filter_accel = max_filter_accel
+        self.filter_dt = filter_dt
+        self.n_substeps = math.ceil(dt / filter_dt)
+        self.h = dt / self.n_substeps
         self.max_steps_in_episode = max_steps_in_episode
         # A max-magnitude velocity command covers max_speed*dt of ground per step,
         # so cap displacement actions at that same per-step reach.
         self.max_action = max_speed if not use_displacement_action else max_speed * dt
+        if use_velocity_filter:
+            # As in deployment, filtered velocity actions are normalized and scaled by max_speed.
+            self.max_action = 1.0
 
         self.agents = [f"agent_{i}" for i in range(self.n_agents)]
         self.n_tokens = len(set(token for token, _, _ in self.label_regions()))
@@ -72,7 +99,8 @@ class DroneEnv(MultiAgentEnv):
     ) -> Tuple[Dict[str, chex.Array], DroneEnvState]:
         positions = jnp.zeros((self.n_agents, 3), dtype=jnp.float32)
         velocities = jnp.zeros((self.n_agents, 3), dtype=jnp.float32)
-        state = DroneEnvState(positions=positions, velocities=velocities, time=0)
+        accelerations = jnp.zeros((self.n_agents, 3), dtype=jnp.float32)
+        state = DroneEnvState(positions=positions, velocities=velocities, accelerations=accelerations, time=0)
         return self.get_obs(state=state), state
 
     @partial(jax.jit, static_argnums=(0,))
@@ -84,12 +112,20 @@ class DroneEnv(MultiAgentEnv):
     ) -> Tuple[Dict[str, chex.Array], DroneEnvState, Dict[str, float], Dict[str, bool], Dict]:
         action = jnp.stack([actions[agent] for agent in self.agents])
         action = jnp.clip(action, -self.max_action, self.max_action)
-        delta = action if self.use_displacement_action else action * self.dt
-        positions = jnp.clip(state.positions + delta, self.low, self.high)
-        # Achieved velocity, not the commanded one: zero along any axis pinned by the geofence.
-        velocities = (positions - state.positions) / self.dt
+        if self.use_velocity_filter:
+            positions, velocities, accelerations = self.filter_velocity(
+                state.positions, state.velocities, state.accelerations, self.max_speed * action
+            )
+        else:
+            delta = action if self.use_displacement_action else action * self.dt
+            positions = jnp.clip(state.positions + delta, self.low, self.high)
+            # Achieved velocity, not the commanded one: zero along any axis pinned by the geofence.
+            velocities = (positions - state.positions) / self.dt
+            accelerations = state.accelerations
 
-        new_state = DroneEnvState(positions=positions, velocities=velocities, time=state.time + 1)
+        new_state = DroneEnvState(
+            positions=positions, velocities=velocities, accelerations=accelerations, time=state.time + 1
+        )
         done = new_state.time >= self.max_steps_in_episode
 
         rewards = {agent: jnp.zeros((), dtype=jnp.float32) for agent in self.agents}
@@ -100,6 +136,39 @@ class DroneEnv(MultiAgentEnv):
         info = {}
 
         return obs, new_state, rewards, dones, info
+
+    def filter_velocity(
+        self,
+        positions: jax.Array,
+        velocities: jax.Array,
+        accelerations: jax.Array,
+        target_velocities: jax.Array
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """Advances (positions, velocities, accelerations) by one policy step `dt` of the
+        deployed velocity filter, holding `target_velocities` constant throughout.
+
+        Mirrors the deployment's `simulate_step` substep for substep, plus a geofence
+        the deployment doesn't have: an axis at (or pushed past) a wall while moving
+        into it is pinned at the wall and its velocity and acceleration are zeroed.
+        """
+        tau = self.velocity_filter_tau
+
+        def substep(_, carry):
+            p, v, a = carry
+            jerk = (target_velocities - v) / tau**2 - 2.0 * a / tau
+            a_next = a + self.h * jerk
+            # Vector-norm acceleration limit, not a per-axis limit.
+            magnitude = jnp.linalg.norm(a_next, axis=-1, keepdims=True)
+            a_next = a_next * jnp.where(magnitude > self.max_filter_accel, self.max_filter_accel / magnitude, 1.0)
+            v_next = v + self.h * a_next
+            p_next = p + 0.5 * self.h * (v + v_next)
+
+            # An axis at (or pushed past) a wall while moving into it is pinned there.
+            pinned = ((p_next <= self.low) & (v_next < 0)) | ((p_next >= self.high) & (v_next > 0))
+            p_next = jnp.clip(p_next, self.low, self.high)
+            return p_next, jnp.where(pinned, 0.0, v_next), jnp.where(pinned, 0.0, a_next)
+
+        return jax.lax.fori_loop(0, self.n_substeps, substep, (positions, velocities, accelerations))
 
     @partial(jax.jit, static_argnums=(0,))
     def get_obs(

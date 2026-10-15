@@ -1,13 +1,87 @@
 import argparse
 import jax
+import numpy as np
 import jax.numpy as jnp
 from dfa_gym import DroneEnv, DFAWrapper, visualize_drone_state, animate_drone_trace
 from dfax.samplers import RADSampler
 from dfax.utils import list2batch, batch2graph
 
+def simulate_step(position, velocity, acceleration, action,
+                  POLICY_DT, FILTER_DT, TAU, MAX_ACCEL, VELOCITY_SCALE):
+    """The deployment's velocity filter step, as sent by the collaborator deploying on
+    the real drone -- verbatim, except that its module-level constants are arguments.
+    Single agent, float64, no geofence.
+    """
+    # Assumes EMA disabled and optional velocity norm cap disabled.
+    # policy action normalized [-1,1].
+    target_velocity = VELOCITY_SCALE * np.clip(action, -1.0, 1.0)
+
+    p = position.copy()
+    v = velocity.copy()
+    a = acceleration.copy()
+
+    n = int(np.ceil(POLICY_DT / FILTER_DT))
+    h = POLICY_DT / n
+
+    # Hold the policy target constant throughout this 0.1-second interval.
+    for _ in range(n):
+        jerk = (target_velocity - v) / TAU**2 - 2.0 * a / TAU
+
+        a_next = a + h * jerk
+
+        # Vector-norm acceleration limit, not a per-axis limit.
+        magnitude = np.linalg.norm(a_next)
+        if magnitude > MAX_ACCEL:
+            a_next *= MAX_ACCEL / magnitude
+
+        v_next = v + h * a_next
+        p += 0.5 * h * (v + v_next)
+
+        v = v_next
+        a = a_next
+
+    return p, v, a
+
+
+def simulate_step_geofenced(position, velocity, acceleration, action, env):
+    """`simulate_step` plus DroneEnv's geofence: after every substep, an axis at (or
+    pushed past) a wall while moving into it is pinned at the wall and its velocity and
+    acceleration are zeroed.
+    """
+    low, high = np.asarray(env.low, dtype=np.float64), np.asarray(env.high, dtype=np.float64)
+    target_velocity = env.max_speed * np.clip(action, -1.0, 1.0)
+
+    p = position.copy()
+    v = velocity.copy()
+    a = acceleration.copy()
+
+    n = int(np.ceil(env.dt / env.filter_dt))
+    h = env.dt / n
+
+    for _ in range(n):
+        jerk = (target_velocity - v) / env.velocity_filter_tau**2 - 2.0 * a / env.velocity_filter_tau
+        a_next = a + h * jerk
+        magnitude = np.linalg.norm(a_next)
+        if magnitude > env.max_filter_accel:
+            a_next *= env.max_filter_accel / magnitude
+        v_next = v + h * a_next
+        p_next = p + 0.5 * h * (v + v_next)
+
+        pinned = ((p_next <= low) & (v_next < 0)) | ((p_next >= high) & (v_next > 0))
+        p = np.clip(p_next, low, high)
+        v = np.where(pinned, 0.0, v_next)
+        a = np.where(pinned, 0.0, a_next)
+
+    return p, v, a
+
+
+def to_np(x):
+    return np.asarray(x, dtype=np.float64)
+
+
 def test(env, n=100, seed=42):
 
-    print(f"Running tests for {env.name} (n_agents={env.n_agents}, use_displacement_action={env.use_displacement_action}).")
+    print(f"Running tests for {env.name} (n_agents={env.n_agents}, use_displacement_action={env.use_displacement_action}, use_velocity_filter={env.use_velocity_filter}).")
     key = jax.random.PRNGKey(seed)
 
     for i in range(n):
@@ -16,6 +90,7 @@ def test(env, n=100, seed=42):
         _, state = env.reset(key=subkey)
         assert jnp.all(state.positions >= env.low) and jnp.all(state.positions <= env.high)
         assert jnp.all(state.velocities == 0.0)
+        assert jnp.all(state.accelerations == 0.0)
         done = False
         steps = 0
 
@@ -30,19 +105,37 @@ def test(env, n=100, seed=42):
 
             obs, new_state, rewards, dones, _ = env.step_env(step_key, state, actions)
 
-            clipped = jnp.clip(jnp.stack([actions[a] for a in env.agents]), -env.max_action, env.max_action)
-            delta = clipped if env.use_displacement_action else clipped * env.dt
-            expected_positions = jnp.clip(state.positions + delta, env.low, env.high)
-            expected_velocities = (expected_positions - state.positions) / env.dt
-            # atol on velocities is looser: dividing by dt amplifies float32 rounding
-            # differences between this eager recomputation and the jitted step_env.
-            assert jnp.allclose(new_state.positions, expected_positions)
-            assert jnp.allclose(new_state.velocities, expected_velocities, atol=1e-4)
+            if env.use_velocity_filter:
+                # Recompute in float64 from the same prior state, so only one step of
+                # float32 rounding separates this from the jitted step_env.
+                expected = [
+                    simulate_step_geofenced(
+                        to_np(state.positions[i]), to_np(state.velocities[i]), to_np(state.accelerations[i]),
+                        to_np(actions[agent]), env,
+                    )
+                    for i, agent in enumerate(env.agents)
+                ]
+                expected_positions, expected_velocities, expected_accelerations = (np.stack(x) for x in zip(*expected))
+                assert np.allclose(new_state.positions, expected_positions, atol=1e-5)
+                assert np.allclose(new_state.velocities, expected_velocities, atol=1e-5)
+                assert np.allclose(new_state.accelerations, expected_accelerations, atol=1e-4)
+                assert jnp.all(jnp.linalg.norm(new_state.accelerations, axis=-1) <= env.max_filter_accel + 1e-5)
+            else:
+                clipped = jnp.clip(jnp.stack([actions[a] for a in env.agents]), -env.max_action, env.max_action)
+                delta = clipped if env.use_displacement_action else clipped * env.dt
+                expected_positions = jnp.clip(state.positions + delta, env.low, env.high)
+                expected_velocities = (expected_positions - state.positions) / env.dt
+                # atol on velocities is looser: dividing by dt amplifies float32 rounding
+                # differences between this eager recomputation and the jitted step_env.
+                assert jnp.allclose(new_state.positions, expected_positions)
+                assert jnp.allclose(new_state.velocities, expected_velocities, atol=1e-4)
+                assert jnp.all(new_state.accelerations == 0.0)
             assert jnp.all(expected_positions >= env.low) and jnp.all(expected_positions <= env.high)
             assert jnp.all(jnp.abs(expected_velocities) <= env.max_speed + 1e-6)
 
             for i, agent in enumerate(env.agents):
                 assert jnp.allclose(obs[agent], jnp.concatenate([expected_positions[i], expected_velocities[i]]), atol=1e-4)
+                assert jnp.array_equal(obs[agent], jnp.concatenate([new_state.positions[i], new_state.velocities[i]]))
 
             expected_done = new_state.time >= env.max_steps_in_episode
             for agent in env.agents:
@@ -54,6 +147,66 @@ def test(env, n=100, seed=42):
             done = dones["__all__"]
             steps += 1
             assert steps <= env.max_steps_in_episode
+
+        print(f"Test completed for {i + 1} samples.", end="\r")
+
+    print(f"Test completed for {n} samples.")
+
+
+def test_filter_matches_reference(env, n=10, seed=42):
+    """Checks DroneEnv's velocity filter against the deployment's `simulate_step`.
+
+    `env` must have a box large enough that the geofence (which the deployment
+    doesn't have) is never hit. Each step is compared both one-step (the reference
+    run from the env's own prior state) and open-loop (a float64 reference
+    trajectory carried across the whole episode, as in the deployment rollout).
+    """
+
+    assert env.use_velocity_filter
+    print(f"Running filter reference tests for {env.name} (n_agents={env.n_agents}, tau={env.velocity_filter_tau}, "
+          f"max_filter_accel={env.max_filter_accel}, filter_dt={env.filter_dt}, max_speed={env.max_speed}).")
+    constants = dict(POLICY_DT=env.dt, FILTER_DT=env.filter_dt, TAU=env.velocity_filter_tau,
+                     MAX_ACCEL=env.max_filter_accel, VELOCITY_SCALE=env.max_speed)
+    key = jax.random.PRNGKey(seed)
+
+    for i in range(n):
+
+        key, subkey = jax.random.split(key)
+        _, state = env.reset(key=subkey)
+        trajectory = [(np.zeros(3), np.zeros(3), np.zeros(3)) for _ in env.agents]
+        done = False
+
+        while not done:
+            key, action_key, step_key = jax.random.split(key, 3)
+            # also exercise the [-1, 1] action clipping
+            action_keys = jax.random.split(action_key, env.n_agents)
+            actions = {
+                agent: jax.random.uniform(k, (3,), minval=-1.5, maxval=1.5)
+                for agent, k in zip(env.agents, action_keys)
+            }
+
+            obs, new_state, _, dones, _ = env.step_env(step_key, state, actions)
+
+            for j, agent in enumerate(env.agents):
+                p, v, a = simulate_step(
+                    to_np(state.positions[j]), to_np(state.velocities[j]), to_np(state.accelerations[j]),
+                    to_np(actions[agent]), **constants,
+                )
+                assert np.allclose(new_state.positions[j], p, atol=1e-5)
+                assert np.allclose(new_state.velocities[j], v, atol=1e-5)
+                assert np.allclose(new_state.accelerations[j], a, atol=1e-4)
+
+                trajectory[j] = simulate_step(*trajectory[j], to_np(actions[agent]), **constants)
+                p, v, a = trajectory[j]
+                assert np.allclose(new_state.positions[j], p, atol=1e-4)
+                assert np.allclose(new_state.velocities[j], v, atol=1e-4)
+                assert np.allclose(new_state.accelerations[j], a, atol=1e-3)
+                assert np.all(p > to_np(env.low)) and np.all(p < to_np(env.high)), "geofence hit; use a larger box"
+
+                assert jnp.array_equal(obs[agent], jnp.concatenate([new_state.positions[j], new_state.velocities[j]]))
+
+            state = new_state
+            done = dones["__all__"]
 
         print(f"Test completed for {i + 1} samples.", end="\r")
 
@@ -145,6 +298,7 @@ def test_dfa_wrapper(env, n=5, seed=42):
 
             assert jnp.array_equal(new_state.env_state.positions, expected_env_state.positions)
             assert jnp.array_equal(new_state.env_state.velocities, expected_env_state.velocities)
+            assert jnp.array_equal(new_state.env_state.accelerations, expected_env_state.accelerations)
             assert jnp.array_equal(new_state.env_state.time, expected_env_state.time)
             for agent in env.agents:
                 assert jnp.array_equal(new_state.env_obs[agent], expected_env_obs[agent])
@@ -191,6 +345,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--test-drone-env", action="store_true")
+    parser.add_argument("--test-filter-reference", action="store_true")
     parser.add_argument("--test-dfa-wrapper", action="store_true")
     parser.add_argument("--visualize-init-state", action="store_true")
     parser.add_argument("--generate-gif", action="store_true")
@@ -199,14 +354,27 @@ if __name__ == '__main__':
     if args.test_drone_env:
         test(DroneEnv(n_agents=1, use_displacement_action=False))
         test(DroneEnv(n_agents=3, use_displacement_action=False))
+        test(DroneEnv(n_agents=3, max_speed=2.0))
         test(DroneEnv(n_agents=1, use_displacement_action=True))
         test(DroneEnv(n_agents=3, use_displacement_action=True, x_low=-2.0, x_high=2.0, y_low=-1.5, y_high=1.5, z_low=0.0, z_high=2.0))
+        test(DroneEnv(n_agents=1, use_velocity_filter=True))
+        test(DroneEnv(n_agents=3, use_velocity_filter=True))
+        test(DroneEnv(n_agents=3, use_velocity_filter=True, max_speed=2.0, x_low=-2.0, x_high=2.0, y_low=-1.5, y_high=1.5, z_low=0.0, z_high=2.0))
+
+    if args.test_filter_reference:
+        big_box = dict(x_low=-50.0, x_high=50.0, y_low=-50.0, y_high=50.0, z_low=-50.0, z_high=50.0)
+        test_filter_matches_reference(DroneEnv(n_agents=1, use_velocity_filter=True, **big_box))
+        test_filter_matches_reference(DroneEnv(n_agents=3, use_velocity_filter=True, max_speed=2.0, velocity_filter_tau=0.2,
+                                               max_filter_accel=5.0, filter_dt=0.01, **big_box))
 
     if args.test_dfa_wrapper:
         env = DroneEnv(n_agents=1, max_steps_in_episode=20)
         test_dfa_wrapper(DFAWrapper(env=env, sampler=RADSampler(n_tokens=env.n_tokens)))
 
         env = DroneEnv(n_agents=3, max_steps_in_episode=20)
+        test_dfa_wrapper(DFAWrapper(env=env, sampler=RADSampler(n_tokens=env.n_tokens)))
+
+        env = DroneEnv(n_agents=3, use_velocity_filter=True, max_steps_in_episode=20)
         test_dfa_wrapper(DFAWrapper(env=env, sampler=RADSampler(n_tokens=env.n_tokens)))
 
     if args.visualize_init_state:
