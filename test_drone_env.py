@@ -3,6 +3,7 @@ import jax
 import numpy as np
 import jax.numpy as jnp
 from dfa_gym import DroneEnv, DFAWrapper, visualize_drone_state, animate_drone_trace
+from dfax import DFAx
 from dfax.samplers import RADSampler
 from dfax.utils import list2batch, batch2graph
 
@@ -91,6 +92,7 @@ def test(env, n=100, seed=42):
         assert jnp.all(state.positions >= env.low) and jnp.all(state.positions <= env.high)
         assert jnp.all(state.velocities == 0.0)
         assert jnp.all(state.accelerations == 0.0)
+        assert jnp.array_equal(state.prev_positions, state.positions)
         done = False
         steps = 0
 
@@ -132,6 +134,7 @@ def test(env, n=100, seed=42):
                 assert jnp.all(new_state.accelerations == 0.0)
             assert jnp.all(expected_positions >= env.low) and jnp.all(expected_positions <= env.high)
             assert jnp.all(jnp.abs(expected_velocities) <= env.max_speed + 1e-6)
+            assert jnp.array_equal(new_state.prev_positions, state.positions)
 
             for i, agent in enumerate(env.agents):
                 assert jnp.allclose(obs[agent], jnp.concatenate([expected_positions[i], expected_velocities[i]]), atol=1e-4)
@@ -211,6 +214,48 @@ def test_filter_matches_reference(env, n=10, seed=42):
         print(f"Test completed for {i + 1} samples.", end="\r")
 
     print(f"Test completed for {n} samples.")
+
+
+def test_label_f_on_entry():
+    """Checks that label_f fires a token only on the step its region is entered (no
+    "sticky color"): staying inside yields -1, and re-triggering requires exiting first.
+
+    Scripted displacement actions of up to 0.8 per axis land each agent exactly on
+    region centers of the default box (r = 0.2), well away from region boundaries.
+    """
+
+    print("Running label_f on-entry tests for DroneEnv.")
+    env = DroneEnv(n_agents=2, use_displacement_action=True, max_speed=8.0)
+    stay = (0.0, 0.0, 0.0)
+    moves = {
+        # Enter the token-1 circle at (0, -0.8), stay twice, exit to the origin, re-enter.
+        "agent_0": [(0.0, -0.8, 0.0), stay, stay, (0.0, 0.8, 0.0), (0.0, -0.8, 0.0)],
+        # Enter corridor 2, move straight into corner 0, straight back into corridor 2, stay.
+        "agent_1": [(-0.8, -0.4, 0.0), (0.0, -0.4, 0.0), (0.0, 0.4, 0.0), stay, stay],
+    }
+    expected_labels = {"agent_0": [1, -1, -1, -1, 1], "agent_1": [2, 0, 2, -1, -1]}
+
+    # "Reach token 1, then reach token 1": token 1 moves s0 -> s1 -> s2 (accepting, absorbing).
+    transitions = jnp.tile(jnp.arange(3, dtype=jnp.int32)[:, None], (1, env.n_tokens))
+    transitions = transitions.at[0, 1].set(1).at[1, 1].set(2)
+    dfa = DFAx.create(start=0, transitions=transitions, labels=jnp.array([False, False, True]))
+
+    key = jax.random.PRNGKey(0)
+    _, state = env.reset(key)
+    assert all(label == -1 for label in env.label_f(state).values())
+
+    for t in range(len(expected_labels["agent_0"])):
+        actions = {agent: jnp.array(moves[agent][t], dtype=jnp.float32) for agent in env.agents}
+        _, state, _, _, _ = env.step_env(key, state, actions)
+        labels = env.label_f(state)
+        for agent in env.agents:
+            assert labels[agent] == expected_labels[agent][t], (agent, t, labels[agent])
+
+        dfa = dfa.advance(labels["agent_0"])
+        # Sitting on token 1 must not count as visiting it twice; only the re-entry does.
+        assert dfa.reward() == (1.0 if t == 4 else 0.0)
+
+    print("Test completed.")
 
 
 def test_dfa_wrapper(env, n=5, seed=42):
@@ -346,6 +391,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--test-drone-env", action="store_true")
     parser.add_argument("--test-filter-reference", action="store_true")
+    parser.add_argument("--test-label-f", action="store_true")
     parser.add_argument("--test-dfa-wrapper", action="store_true")
     parser.add_argument("--visualize-init-state", action="store_true")
     parser.add_argument("--generate-gif", action="store_true")
@@ -366,6 +412,9 @@ if __name__ == '__main__':
         test_filter_matches_reference(DroneEnv(n_agents=1, use_velocity_filter=True, **big_box))
         test_filter_matches_reference(DroneEnv(n_agents=3, use_velocity_filter=True, max_speed=2.0, velocity_filter_tau=0.2,
                                                max_filter_accel=5.0, filter_dt=0.01, **big_box))
+
+    if args.test_label_f:
+        test_label_f_on_entry()
 
     if args.test_dfa_wrapper:
         env = DroneEnv(n_agents=1, max_steps_in_episode=20)

@@ -31,6 +31,7 @@ class DroneEnvState(State):
     positions: jax.Array
     velocities: jax.Array
     accelerations: jax.Array  # Velocity filter state; stays zero when the filter is off.
+    prev_positions: jax.Array  # Positions one step earlier, so label_f only fires on entering a region.
     time: int
 
 class DroneEnv(MultiAgentEnv):
@@ -100,7 +101,9 @@ class DroneEnv(MultiAgentEnv):
         positions = jnp.zeros((self.n_agents, 3), dtype=jnp.float32)
         velocities = jnp.zeros((self.n_agents, 3), dtype=jnp.float32)
         accelerations = jnp.zeros((self.n_agents, 3), dtype=jnp.float32)
-        state = DroneEnvState(positions=positions, velocities=velocities, accelerations=accelerations, time=0)
+        state = DroneEnvState(
+            positions=positions, velocities=velocities, accelerations=accelerations, prev_positions=positions, time=0
+        )
         return self.get_obs(state=state), state
 
     @partial(jax.jit, static_argnums=(0,))
@@ -124,7 +127,8 @@ class DroneEnv(MultiAgentEnv):
             accelerations = state.accelerations
 
         new_state = DroneEnvState(
-            positions=positions, velocities=velocities, accelerations=accelerations, time=state.time + 1
+            positions=positions, velocities=velocities, accelerations=accelerations,
+            prev_positions=state.positions, time=state.time + 1
         )
         done = new_state.time >= self.max_steps_in_episode
 
@@ -230,8 +234,11 @@ class DroneEnv(MultiAgentEnv):
         self,
         state: DroneEnvState
     ) -> Dict[str, int]:
-        # Labels the agent's full (x, y, z) position -- each region is a 1.0-tall prism.
-        x, y, z = state.positions[:, 0], state.positions[:, 1], state.positions[:, 2]
+        # Labels the agent's full (x, y, z) position -- each region is a 1.0-tall prism -- before
+        # and after the last step: a token fires only on the step its region is entered, not on
+        # every step the agent stays inside it.
+        positions = jnp.stack([state.prev_positions, state.positions])
+        x, y, z = positions[..., 0], positions[..., 1], positions[..., 2]
         labels = jnp.full(x.shape, -1, dtype=jnp.int32)
         for token, kind, params in reversed(self.label_regions()):
             if kind == "circle":
@@ -241,5 +248,6 @@ class DroneEnv(MultiAgentEnv):
                 x_lo, x_hi, y_lo, y_hi, z_lo, z_hi = params
                 mask = (x >= x_lo) & (x <= x_hi) & (y >= y_lo) & (y <= y_hi) & (z >= z_lo) & (z <= z_hi)
             labels = jnp.where(mask, token, labels)
+        labels = jnp.where(labels[1] != labels[0], labels[1], -1)
 
         return {agent: labels[i] for i, agent in enumerate(self.agents)}
