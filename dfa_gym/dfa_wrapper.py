@@ -218,17 +218,16 @@ class DFAWrapper(MultiAgentEnv):
 
         unshaped_rewards = rewards
         potentials = state.potentials
+        pbrs_rewards = {agent: jnp.zeros((), dtype=jnp.float32) for agent in self.agents}
         if self.gamma is not None:
             potentials = {agent: self.potential(dfas[agent], dones[agent]) for agent in self.agents}
-            rewards = {
-                agent: rewards[agent] + self.gamma * potentials[agent] - state.potentials[agent]
-                for agent in self.agents
-            }
+            pbrs_rewards = {agent: self.gamma * potentials[agent] - state.potentials[agent] for agent in self.agents}
+            rewards = {agent: rewards[agent] + pbrs_rewards[agent] for agent in self.agents}
 
-        # Reward without shaping and potential of the next state, as (num_agents,) arrays like other per-agent infos
+        # Reward without shaping and the shaping term, as (num_agents,) arrays like other per-agent infos
         infos = {
-            "reward": jnp.array([unshaped_rewards[agent] for agent in self.agents]),
-            "potential": jnp.array([potentials[agent] for agent in self.agents]),
+            "unshaped_reward": jnp.array([unshaped_rewards[agent] for agent in self.agents]),
+            "pbrs_reward": jnp.array([pbrs_rewards[agent] for agent in self.agents]),
         }
 
         state = DFAWrapperState(

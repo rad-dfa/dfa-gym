@@ -146,12 +146,12 @@ def test_dfa_wrapper_pbrs(env, gamma, beta, n=20, seed=42, **kwargs):
         assert jax.tree.all(jax.tree.map(jnp.array_equal, dones, base_dones))
         assert_same_except_potentials(new_state, new_base_state)
 
-        # infos holds the reward without shaping and the potential of the next state, zero without shaping
-        assert set(infos.keys()) == set(base_infos.keys()) == {"reward", "potential"}
-        assert infos["reward"].shape == infos["potential"].shape == (env.num_agents,)
-        assert jnp.array_equal(infos["reward"], base_infos["reward"])
-        assert jnp.array_equal(base_infos["reward"], jnp.array([base_rewards[agent] for agent in env.agents]))
-        assert jnp.array_equal(base_infos["potential"], jnp.zeros(env.num_agents))
+        # infos holds the reward without shaping and the shaping term, zero without shaping
+        assert set(infos.keys()) == set(base_infos.keys()) == {"unshaped_reward", "pbrs_reward"}
+        assert infos["unshaped_reward"].shape == infos["pbrs_reward"].shape == (env.num_agents,)
+        assert jnp.array_equal(infos["unshaped_reward"], base_infos["unshaped_reward"])
+        assert jnp.array_equal(base_infos["unshaped_reward"], jnp.array([base_rewards[agent] for agent in env.agents]))
+        assert jnp.array_equal(base_infos["pbrs_reward"], jnp.zeros(env.num_agents))
 
         for i, agent in enumerate(env.agents):
             shaping = float(rewards[agent] - base_rewards[agent])
@@ -159,7 +159,8 @@ def test_dfa_wrapper_pbrs(env, gamma, beta, n=20, seed=42, **kwargs):
             # Every agent is done on __all__, and new_state is then already the reset state
             next_potential = 0.0 if dones["__all__"] else potential(new_state.dfas[agent], bool(dones[agent]))
             assert 0.0 <= next_potential <= 1.0
-            assert jnp.allclose(infos["potential"][i], next_potential)
+            assert abs(float(infos["pbrs_reward"][i]) - shaping) < 1e-5
+            assert abs(float(rewards[agent] - infos["unshaped_reward"][i] - infos["pbrs_reward"][i])) < 1e-5
             if not dones["__all__"]:
                 assert jnp.allclose(new_state.potentials[agent], next_potential)
 
