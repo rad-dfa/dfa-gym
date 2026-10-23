@@ -19,6 +19,7 @@ class DFAWrapperState(State):
     env_state: State
     sym2tkn: chex.Array # From DFA alphabet symbols to environment tokens
     tkn2sym: chex.Array # From environment tokens to DFA alphabet symbols
+    potentials: Dict[str, float] # Shaping potentials of the current state, zero when shaping is disabled
 
 class DFAWrapper(MultiAgentEnv):
 
@@ -26,6 +27,7 @@ class DFAWrapper(MultiAgentEnv):
         self,
         env: MultiAgentEnv,
         gamma: float | None = None,
+        beta: float | None = None,
         sampler: DFASampler = RADSampler(),
         binary_reward: bool = True,
         progress: bool = True,
@@ -37,6 +39,7 @@ class DFAWrapper(MultiAgentEnv):
         super().__init__(num_agents=env.num_agents)
         self.env = env
         self.gamma = gamma
+        self.beta = beta
         self.sampler = sampler
         self.binary_reward = binary_reward
         self.progress = progress
@@ -46,6 +49,9 @@ class DFAWrapper(MultiAgentEnv):
         self.dynamic_alphabet = dynamic_alphabet
 
         assert (self.embedder is None) == (self.embedding_dim is None)
+        # Potential-based shaping with potential beta**dist2accept, where gamma must be the learner's discount factor
+        assert (self.gamma is None) == (self.beta is None)
+        assert (self.gamma is None) or ((0 < self.gamma <= 1) and (0 < self.beta < 1))
         assert self.dynamic_alphabet or (self.sampler.n_tokens == self.env.n_tokens)
         assert (not self.dynamic_alphabet) or ((self.sampler.n_tokens <= self.env.n_tokens) and (self.embedder is None))
         assert hasattr(self.env, "label_f") and callable(self.env.label_f), \
@@ -156,6 +162,11 @@ class DFAWrapper(MultiAgentEnv):
             for i, agent in enumerate(self.agents)
         }
 
+        if self.gamma is not None:
+            potentials = {agent: self.potential(dfas[agent], dfas[agent].n_states <= 1) for agent in self.agents}
+        else:
+            potentials = {agent: jnp.zeros((), dtype=jnp.float32) for agent in self.agents}
+
         state = DFAWrapperState(
             dfas=dfas,
             init_dfas={agent: dfas[agent] for agent in self.agents},
@@ -163,6 +174,7 @@ class DFAWrapper(MultiAgentEnv):
             env_state=env_state,
             sym2tkn=sym2tkn,
             tkn2sym=tkn2sym,
+            potentials=potentials,
         )
         obs = self.get_obs(state=state)
 
@@ -204,13 +216,20 @@ class DFAWrapper(MultiAgentEnv):
             for agent in self.agents
         }
 
+        unshaped_rewards = rewards
+        potentials = state.potentials
         if self.gamma is not None:
+            potentials = {agent: self.potential(dfas[agent], dones[agent]) for agent in self.agents}
             rewards = {
-                agent: rewards[agent] + self.gamma * dfas[agent].reward(binary=self.binary_reward) - state.dfas[agent].reward(binary=self.binary_reward)
+                agent: rewards[agent] + self.gamma * potentials[agent] - state.potentials[agent]
                 for agent in self.agents
             }
 
-        infos = {}
+        # Reward without shaping and potential of the next state, as (num_agents,) arrays like other per-agent infos
+        infos = {
+            "reward": jnp.array([unshaped_rewards[agent] for agent in self.agents]),
+            "potential": jnp.array([potentials[agent] for agent in self.agents]),
+        }
 
         state = DFAWrapperState(
             dfas=dfas,
@@ -219,11 +238,16 @@ class DFAWrapper(MultiAgentEnv):
             env_state=env_state,
             sym2tkn=state.sym2tkn,
             tkn2sym=state.tkn2sym,
+            potentials=potentials,
         )
 
         obs = self.get_obs(state=state)
 
         return obs, state, rewards, dones, infos
+
+    def potential(self, dfa: dfax.DFAx, done: bool) -> float:
+        # Zero at terminal states, so the discounted shaping telescopes to -potential(s_0) and preserves optimal policies
+        return jnp.where(done, 0.0, self.beta ** dfa.dist2accept())
 
     @partial(jax.jit, static_argnums=(0,))
     def get_obs(
