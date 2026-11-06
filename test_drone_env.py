@@ -1,3 +1,4 @@
+import math
 import argparse
 import jax
 import numpy as np
@@ -310,6 +311,83 @@ def test_label_regions(env):
     print("Test completed.")
 
 
+def test_obs_noise(n=20, seed=42, **kwargs):
+    """Checks DroneEnv(**kwargs)'s observation noise (kwargs must enable it) against a
+    noise-free copy stepped with the same keys and actions: the true state, rewards and
+    dones are identical (the noise never leaks into them), and the observation noise is
+    zero-mean, truncated to +-3 std, with the std of a +-3-truncated normal, fresh per
+    agent and per step, and reproducible from the key.
+    """
+
+    env = DroneEnv(**kwargs)
+    clean_env = DroneEnv(**{**kwargs, "obs_noise_std": 0.0})
+    assert env.use_obs_noise and not clean_env.use_obs_noise
+    print(f"Running observation noise tests for {env.name} (n_agents={env.n_agents}, "
+          f"use_velocity_filter={env.use_velocity_filter}, obs_noise_std={env.obs_noise_std}).")
+    scale = to_np(env.obs_noise_scale)
+    key = jax.random.PRNGKey(seed)
+    noises = []
+
+    def record(obs, clean_obs, state):
+        step_noise = []
+        for i, agent in enumerate(env.agents):
+            truth = jnp.concatenate([state.positions[i], state.velocities[i]])
+            assert jnp.array_equal(clean_obs[agent], truth)
+            assert env.observation_space(agent).contains(obs[agent])
+            step_noise.append(to_np(obs[agent]) - to_np(truth))
+        step_noise = np.stack(step_noise)
+        assert np.all(np.abs(step_noise) <= env.OBS_NOISE_MAX_SIGMAS * scale + 1e-5)
+        if env.n_agents > 1:
+            assert not np.allclose(step_noise[0], step_noise[1]), "agents got the same noise"
+        if noises:
+            assert not np.allclose(step_noise, noises[-1]), "consecutive steps got the same noise"
+        noises.append(step_noise)
+
+    for i in range(n):
+
+        key, subkey = jax.random.split(key)
+        obs, state = env.reset(key=subkey)
+        clean_obs, clean_state = clean_env.reset(key=subkey)
+        assert jax.tree.all(jax.tree.map(jnp.array_equal, state, clean_state))
+        record(obs, clean_obs, state)
+        done = False
+
+        while not done:
+            key, action_key, step_key = jax.random.split(key, 3)
+            action_keys = jax.random.split(action_key, env.n_agents)
+            actions = {agent: env.action_space(agent).sample(k) for agent, k in zip(env.agents, action_keys)}
+
+            prev_state = state
+            obs, state, rewards, dones, _ = env.step_env(step_key, prev_state, actions)
+            clean_obs, clean_state, clean_rewards, clean_dones, _ = clean_env.step_env(step_key, clean_state, actions)
+            assert jax.tree.all(jax.tree.map(jnp.array_equal, state, clean_state))
+            assert rewards == clean_rewards and dones == clean_dones
+            record(obs, clean_obs, state)
+
+            # Same key, same noise.
+            again, _, _, _, _ = env.step_env(step_key, prev_state, actions)
+            assert all(jnp.array_equal(again[agent], obs[agent]) for agent in env.agents)
+            done = dones["__all__"]
+
+        print(f"Test completed for {i + 1} samples.", end="\r")
+
+    noise = np.concatenate(noises).reshape(-1, 6)
+    assert len(noise) >= 1000, f"only {len(noise)} noise samples; raise n"
+    # Std of a standard normal truncated to +-k.
+    k = env.OBS_NOISE_MAX_SIGMAS
+    pdf = math.exp(-0.5 * k ** 2) / math.sqrt(2 * math.pi)
+    truncated_std = math.sqrt(1 - 2 * k * pdf / math.erf(k / math.sqrt(2)))
+    for j in range(6):
+        if scale[j] == 0:
+            assert np.all(noise[:, j] == 0)
+            continue
+        expected_std = scale[j] * truncated_std
+        assert abs(noise[:, j].mean()) < 4 * expected_std / math.sqrt(len(noise)), (j, noise[:, j].mean())
+        assert abs(noise[:, j].std() / expected_std - 1) < 0.05, (j, noise[:, j].std(), expected_std)
+
+    print(f"Test completed for {n} samples ({len(noise)} noise samples).")
+
+
 def test_dfa_wrapper(env, n=5, seed=42):
     """Tests DFAWrapper(env=DroneEnv(...)): verifies the augmented obs dict and the
     DFA/reward/done wiring, treating DroneEnv.step_env/label_f and DFAx's own
@@ -445,6 +523,7 @@ if __name__ == '__main__':
     parser.add_argument("--test-filter-reference", action="store_true")
     parser.add_argument("--test-label-f", action="store_true")
     parser.add_argument("--test-regions", action="store_true")
+    parser.add_argument("--test-obs-noise", action="store_true")
     parser.add_argument("--test-dfa-wrapper", action="store_true")
     parser.add_argument("--visualize-init-state", action="store_true")
     parser.add_argument("--generate-gif", action="store_true")
@@ -468,6 +547,11 @@ if __name__ == '__main__':
         test_label_regions(DroneEnv(region_margin=0.0, region_gap=0.0))
         test_label_regions(DroneEnv(region_margin=0.4, region_gap=0.05))
 
+    if args.test_obs_noise:
+        test_obs_noise(n_agents=3, obs_noise_std=(0.02, 0.1))
+        test_obs_noise(n_agents=1, use_velocity_filter=True, obs_noise_std=0.05)
+        test_obs_noise(n_agents=2, obs_noise_std=(0.0, 0.1))
+
     if args.test_filter_reference:
         big_box = dict(x_low=-50.0, x_high=50.0, y_low=-50.0, y_high=50.0, z_low=-50.0, z_high=50.0)
         test_filter_matches_reference(DroneEnv(n_agents=1, use_velocity_filter=True, **big_box))
@@ -485,6 +569,9 @@ if __name__ == '__main__':
         test_dfa_wrapper(DFAWrapper(env=env, sampler=RADSampler(n_tokens=env.n_tokens)))
 
         env = DroneEnv(n_agents=3, use_velocity_filter=True, max_steps_in_episode=20)
+        test_dfa_wrapper(DFAWrapper(env=env, sampler=RADSampler(n_tokens=env.n_tokens)))
+
+        env = DroneEnv(n_agents=3, obs_noise_std=(0.02, 0.1), max_steps_in_episode=20)
         test_dfa_wrapper(DFAWrapper(env=env, sampler=RADSampler(n_tokens=env.n_tokens)))
 
     if args.visualize_init_state:

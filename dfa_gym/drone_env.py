@@ -11,6 +11,12 @@ The labeled regions sit `region_margin` inside the box walls (in x and y), leavi
 room to turn without leaving the box or touching a color, and neighboring regions
 are `region_gap` apart.
 
+Observation noise is off by default. If `obs_noise_std` > 0 (a single std, or a
+(position_std, velocity_std) pair), every observation, at reset and at every step,
+gets fresh zero-mean Gaussian noise truncated to +-3 std, drawn independently per
+agent. The noise only changes what the policy sees: the dynamics, `label_f`, and
+the out-of-bounds check all use the true state.
+
 If `use_velocity_filter=True`, velocity commands instead go through the deployed
 drone's velocity filter: the action is normalized to [-1, 1] and scaled by
 `max_speed` into a target velocity, which is held for the whole policy step `dt`,
@@ -43,6 +49,10 @@ class DroneEnvState(State):
 
 class DroneEnv(MultiAgentEnv):
 
+    # Observation noise is a standard normal truncated to this many stds, so noisy
+    # observations stay within the (widened) declared observation space.
+    OBS_NOISE_MAX_SIGMAS = 3.0
+
     def __init__(
         self,
         n_agents: int = 1,
@@ -63,9 +73,15 @@ class DroneEnv(MultiAgentEnv):
         region_margin: float = 0.25,
         region_gap: float = 0.1,
         out_of_bounds_reward: float = 0.0,
+        obs_noise_std: float | Tuple[float, float] = 0.0,
     ) -> None:
         assert not (use_displacement_action and use_velocity_filter), "the velocity filter only applies to velocity actions"
         assert region_margin >= 0 and region_gap >= 0, "region_margin and region_gap must be non-negative"
+        if isinstance(obs_noise_std, (int, float)):
+            pos_noise_std = vel_noise_std = float(obs_noise_std)
+        else:
+            pos_noise_std, vel_noise_std = (float(std) for std in obs_noise_std)
+        assert pos_noise_std >= 0 and vel_noise_std >= 0, "obs_noise_std must be non-negative"
         super().__init__(num_agents=n_agents)
         self.n_agents = n_agents
         self.low = jnp.array([x_low, y_low, z_low], dtype=jnp.float32)
@@ -83,6 +99,9 @@ class DroneEnv(MultiAgentEnv):
         self.region_margin = region_margin
         self.region_gap = region_gap
         self.out_of_bounds_reward = out_of_bounds_reward
+        self.obs_noise_std = obs_noise_std
+        self.obs_noise_scale = jnp.array([pos_noise_std] * 3 + [vel_noise_std] * 3, dtype=jnp.float32)
+        self.use_obs_noise = pos_noise_std > 0 or vel_noise_std > 0
         # A max-magnitude velocity command covers max_speed*dt of ground per step,
         # so cap displacement actions at that same per-step reach.
         self.max_action = max_speed if not use_displacement_action else max_speed * dt
@@ -102,11 +121,14 @@ class DroneEnv(MultiAgentEnv):
         }
         # Nothing is clipped, so the last observation of an episode that ends by leaving
         # the box can lie up to one step's reach (max_speed * dt per axis) past a wall.
+        # Observation noise widens both bounds by its maximum magnitude.
         reach = self.max_speed * self.dt
+        pos_slack = reach + self.OBS_NOISE_MAX_SIGMAS * pos_noise_std
+        vel_bound = (self.max_speed + self.OBS_NOISE_MAX_SIGMAS * vel_noise_std) * jnp.ones(3, dtype=jnp.float32)
         self.observation_spaces = {
             agent: spaces.Box(
-                low=jnp.concatenate([self.low - reach, -self.max_speed * jnp.ones(3, dtype=jnp.float32)]),
-                high=jnp.concatenate([self.high + reach, self.max_speed * jnp.ones(3, dtype=jnp.float32)]),
+                low=jnp.concatenate([self.low - pos_slack, -vel_bound]),
+                high=jnp.concatenate([self.high + pos_slack, vel_bound]),
                 shape=(6,),
                 dtype=jnp.float32,
             )
@@ -124,7 +146,7 @@ class DroneEnv(MultiAgentEnv):
         state = DroneEnvState(
             positions=positions, velocities=velocities, accelerations=accelerations, prev_positions=positions, time=0
         )
-        return self.get_obs(state=state), state
+        return self.add_obs_noise(key, self.get_obs(state=state)), state
 
     @partial(jax.jit, static_argnums=(0,))
     def step_env(
@@ -162,7 +184,7 @@ class DroneEnv(MultiAgentEnv):
         dones = {agent: done for agent in self.agents}
         dones["__all__"] = done
 
-        obs = self.get_obs(state=new_state)
+        obs = self.add_obs_noise(key, self.get_obs(state=new_state))
         info = {}
 
         return obs, new_state, rewards, dones, info
@@ -202,6 +224,22 @@ class DroneEnv(MultiAgentEnv):
         return {
             agent: jnp.concatenate([state.positions[i], state.velocities[i]])
             for i, agent in enumerate(self.agents)
+        }
+
+    def add_obs_noise(
+        self,
+        key: chex.PRNGKey,
+        obs: Dict[str, chex.Array]
+    ) -> Dict[str, chex.Array]:
+        """Adds fresh per-agent observation noise (see the module docstring) to `obs`;
+        returns `obs` untouched, drawing no randomness, when noise is disabled."""
+        if not self.use_obs_noise:
+            return obs
+        keys = jax.random.split(key, self.n_agents)
+        bound = self.OBS_NOISE_MAX_SIGMAS
+        return {
+            agent: obs[agent] + self.obs_noise_scale * jax.random.truncated_normal(k, -bound, bound, (6,), jnp.float32)
+            for agent, k in zip(self.agents, keys)
         }
 
     def label_regions(self):
