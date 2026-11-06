@@ -44,36 +44,10 @@ def simulate_step(position, velocity, acceleration, action,
     return p, v, a
 
 
-def simulate_step_geofenced(position, velocity, acceleration, action, env):
-    """`simulate_step` plus DroneEnv's geofence: after every substep, an axis at (or
-    pushed past) a wall while moving into it is pinned at the wall and its velocity and
-    acceleration are zeroed.
-    """
-    low, high = np.asarray(env.low, dtype=np.float64), np.asarray(env.high, dtype=np.float64)
-    target_velocity = env.max_speed * np.clip(action, -1.0, 1.0)
-
-    p = position.copy()
-    v = velocity.copy()
-    a = acceleration.copy()
-
-    n = int(np.ceil(env.dt / env.filter_dt))
-    h = env.dt / n
-
-    for _ in range(n):
-        jerk = (target_velocity - v) / env.velocity_filter_tau**2 - 2.0 * a / env.velocity_filter_tau
-        a_next = a + h * jerk
-        magnitude = np.linalg.norm(a_next)
-        if magnitude > env.max_filter_accel:
-            a_next *= env.max_filter_accel / magnitude
-        v_next = v + h * a_next
-        p_next = p + 0.5 * h * (v + v_next)
-
-        pinned = ((p_next <= low) & (v_next < 0)) | ((p_next >= high) & (v_next > 0))
-        p = np.clip(p_next, low, high)
-        v = np.where(pinned, 0.0, v_next)
-        a = np.where(pinned, 0.0, a_next)
-
-    return p, v, a
+def filter_constants(env):
+    """`simulate_step`'s deployment constants for `env`."""
+    return dict(POLICY_DT=env.dt, FILTER_DT=env.filter_dt, TAU=env.velocity_filter_tau,
+                MAX_ACCEL=env.max_filter_accel, VELOCITY_SCALE=env.max_speed)
 
 
 def to_np(x):
@@ -81,9 +55,17 @@ def to_np(x):
 
 
 def test(env, n=100, seed=42):
+    """Checks DroneEnv.step_env against an independent recomputation: unclipped
+    dynamics (the deployment's `simulate_step` for the velocity filter), and an
+    episode that ends on the step any agent leaves [low, high], with
+    `out_of_bounds_reward` for each agent that left.
+    """
 
-    print(f"Running tests for {env.name} (n_agents={env.n_agents}, use_displacement_action={env.use_displacement_action}, use_velocity_filter={env.use_velocity_filter}).")
+    print(f"Running tests for {env.name} (n_agents={env.n_agents}, use_displacement_action={env.use_displacement_action}, "
+          f"use_velocity_filter={env.use_velocity_filter}, out_of_bounds_reward={env.out_of_bounds_reward}).")
     key = jax.random.PRNGKey(seed)
+    low, high = to_np(env.low), to_np(env.high)
+    n_out_of_bounds = 0
 
     for i in range(n):
 
@@ -111,9 +93,9 @@ def test(env, n=100, seed=42):
                 # Recompute in float64 from the same prior state, so only one step of
                 # float32 rounding separates this from the jitted step_env.
                 expected = [
-                    simulate_step_geofenced(
+                    simulate_step(
                         to_np(state.positions[i]), to_np(state.velocities[i]), to_np(state.accelerations[i]),
-                        to_np(actions[agent]), env,
+                        to_np(actions[agent]), **filter_constants(env),
                     )
                     for i, agent in enumerate(env.agents)
                 ]
@@ -123,28 +105,32 @@ def test(env, n=100, seed=42):
                 assert np.allclose(new_state.accelerations, expected_accelerations, atol=1e-4)
                 assert jnp.all(jnp.linalg.norm(new_state.accelerations, axis=-1) <= env.max_filter_accel + 1e-5)
             else:
-                clipped = jnp.clip(jnp.stack([actions[a] for a in env.agents]), -env.max_action, env.max_action)
+                clipped = np.clip(np.stack([to_np(actions[a]) for a in env.agents]), -env.max_action, env.max_action)
                 delta = clipped if env.use_displacement_action else clipped * env.dt
-                expected_positions = jnp.clip(state.positions + delta, env.low, env.high)
-                expected_velocities = (expected_positions - state.positions) / env.dt
-                # atol on velocities is looser: dividing by dt amplifies float32 rounding
-                # differences between this eager recomputation and the jitted step_env.
-                assert jnp.allclose(new_state.positions, expected_positions)
-                assert jnp.allclose(new_state.velocities, expected_velocities, atol=1e-4)
+                expected_positions = to_np(state.positions) + delta
+                expected_velocities = delta / env.dt
+                assert np.allclose(new_state.positions, expected_positions, atol=1e-5)
+                assert np.allclose(new_state.velocities, expected_velocities, atol=1e-4)
                 assert jnp.all(new_state.accelerations == 0.0)
-            assert jnp.all(expected_positions >= env.low) and jnp.all(expected_positions <= env.high)
-            assert jnp.all(jnp.abs(expected_velocities) <= env.max_speed + 1e-6)
+            assert np.all(np.abs(expected_velocities) <= env.max_speed + 1e-6)
             assert jnp.array_equal(new_state.prev_positions, state.positions)
 
             for i, agent in enumerate(env.agents):
-                assert jnp.allclose(obs[agent], jnp.concatenate([expected_positions[i], expected_velocities[i]]), atol=1e-4)
+                assert np.allclose(obs[agent], np.concatenate([expected_positions[i], expected_velocities[i]]), atol=1e-4)
                 assert jnp.array_equal(obs[agent], jnp.concatenate([new_state.positions[i], new_state.velocities[i]]))
+                assert env.observation_space(agent).contains(obs[agent])
 
-            expected_done = new_state.time >= env.max_steps_in_episode
-            for agent in env.agents:
-                assert rewards[agent] == 0.0
+            # From the env's own positions, so float32 rounding can't flip a near-wall verdict.
+            positions = to_np(new_state.positions)
+            out_of_bounds = np.any((positions < low) | (positions > high), axis=-1)
+            expected_done = bool(new_state.time >= env.max_steps_in_episode or out_of_bounds.any())
+            for i, agent in enumerate(env.agents):
+                assert rewards[agent] == (env.out_of_bounds_reward if out_of_bounds[i] else 0.0)
                 assert dones[agent] == expected_done
             assert dones["__all__"] == expected_done
+            if not expected_done:
+                assert np.all((positions >= low) & (positions <= high))
+            n_out_of_bounds += bool(out_of_bounds.any())
 
             state = new_state
             done = dones["__all__"]
@@ -153,14 +139,15 @@ def test(env, n=100, seed=42):
 
         print(f"Test completed for {i + 1} samples.", end="\r")
 
-    print(f"Test completed for {n} samples.")
+    assert n_out_of_bounds > 0, "No episode ended by leaving the box."
+    print(f"Test completed for {n} samples ({n_out_of_bounds} ended by leaving the box).")
 
 
 def test_filter_matches_reference(env, n=10, seed=42):
     """Checks DroneEnv's velocity filter against the deployment's `simulate_step`.
 
-    `env` must have a box large enough that the geofence (which the deployment
-    doesn't have) is never hit. Each step is compared both one-step (the reference
+    `env` must have a box large enough that no drone leaves it, so every episode runs
+    to max_steps_in_episode. Each step is compared both one-step (the reference
     run from the env's own prior state) and open-loop (a float64 reference
     trajectory carried across the whole episode, as in the deployment rollout).
     """
@@ -168,8 +155,7 @@ def test_filter_matches_reference(env, n=10, seed=42):
     assert env.use_velocity_filter
     print(f"Running filter reference tests for {env.name} (n_agents={env.n_agents}, tau={env.velocity_filter_tau}, "
           f"max_filter_accel={env.max_filter_accel}, filter_dt={env.filter_dt}, max_speed={env.max_speed}).")
-    constants = dict(POLICY_DT=env.dt, FILTER_DT=env.filter_dt, TAU=env.velocity_filter_tau,
-                     MAX_ACCEL=env.max_filter_accel, VELOCITY_SCALE=env.max_speed)
+    constants = filter_constants(env)
     key = jax.random.PRNGKey(seed)
 
     for i in range(n):
@@ -204,7 +190,7 @@ def test_filter_matches_reference(env, n=10, seed=42):
                 assert np.allclose(new_state.positions[j], p, atol=1e-4)
                 assert np.allclose(new_state.velocities[j], v, atol=1e-4)
                 assert np.allclose(new_state.accelerations[j], a, atol=1e-3)
-                assert np.all(p > to_np(env.low)) and np.all(p < to_np(env.high)), "geofence hit; use a larger box"
+                assert np.all(p > to_np(env.low)) and np.all(p < to_np(env.high)), "drone left the box; use a larger box"
 
                 assert jnp.array_equal(obs[agent], jnp.concatenate([new_state.positions[j], new_state.velocities[j]]))
 
@@ -220,20 +206,37 @@ def test_label_f_on_entry():
     """Checks that label_f fires a token only on the step its region is entered (no
     "sticky color"): staying inside yields -1, and re-triggering requires exiting first.
 
-    Scripted displacement actions of up to 0.8 per axis land each agent exactly on
-    region centers of the default box (r = 0.2), well away from region boundaries.
+    Scripted displacement actions land each agent exactly on region centers (looked
+    up from env.label_regions()), well away from region boundaries.
     """
 
     print("Running label_f on-entry tests for DroneEnv.")
     env = DroneEnv(n_agents=2, use_displacement_action=True, max_speed=8.0)
-    stay = (0.0, 0.0, 0.0)
-    moves = {
-        # Enter the token-1 circle at (0, -0.8), stay twice, exit to the origin, re-enter.
-        "agent_0": [(0.0, -0.8, 0.0), stay, stay, (0.0, 0.8, 0.0), (0.0, -0.8, 0.0)],
-        # Enter corridor 2, move straight into corner 0, straight back into corridor 2, stay.
-        "agent_1": [(-0.8, -0.4, 0.0), (0.0, -0.4, 0.0), (0.0, 0.4, 0.0), stay, stay],
+    regions = env.label_regions()
+
+    def center(index):
+        _, kind, params = regions[index]
+        if kind == "circle":
+            return float(params[0]), float(params[1])
+        return 0.5 * float(params[0] + params[1]), 0.5 * float(params[2] + params[3])
+
+    # label_regions() order: corners 0-3 (token 0), edge midpoints 4-7 (token 1), corridors 8-15 (tokens 2-9).
+    corner_0, bottom_mid, corridor_2 = center(0), center(4), center(8)
+    assert [regions[k][0] for k in (0, 4, 8)] == [0, 1, 2]
+    origin = (0.0, 0.0)
+    waypoints = {
+        # Enter the bottom edge-midpoint circle (token 1), stay twice, exit to the origin, re-enter.
+        "agent_0": [bottom_mid, bottom_mid, bottom_mid, origin, bottom_mid],
+        # Enter corridor 2, move into corner 0, back into corridor 2, stay.
+        "agent_1": [corridor_2, corner_0, corridor_2, corridor_2, corridor_2],
     }
     expected_labels = {"agent_0": [1, -1, -1, -1, 1], "agent_1": [2, 0, 2, -1, -1]}
+    # Displacements between consecutive waypoints (z stays at 0, inside every region's z range).
+    moves = {
+        agent: [(x1 - x0, y1 - y0, 0.0) for (x0, y0), (x1, y1) in zip([origin] + points, points)]
+        for agent, points in waypoints.items()
+    }
+    assert all(abs(d) <= env.max_action for agent_moves in moves.values() for move in agent_moves for d in move)
 
     # "Reach token 1, then reach token 1": token 1 moves s0 -> s1 -> s2 (accepting, absorbing).
     transitions = jnp.tile(jnp.arange(3, dtype=jnp.int32)[:, None], (1, env.n_tokens))
@@ -254,6 +257,55 @@ def test_label_f_on_entry():
         dfa = dfa.advance(labels["agent_0"])
         # Sitting on token 1 must not count as visiting it twice; only the re-entry does.
         assert dfa.reward() == (1.0 if t == 4 else 0.0)
+
+    print("Test completed.")
+
+
+def test_label_regions(env):
+    """Checks the label-region layout: every region lies (in x/y) inside
+    [low + region_margin, high - region_margin], and neighboring regions are exactly
+    region_gap apart (no pair closer, and some pair at exactly that distance).
+    """
+
+    print(f"Running label region tests for {env.name} (low={env.low.tolist()}, high={env.high.tolist()}, "
+          f"region_margin={env.region_margin}, region_gap={env.region_gap}).")
+    inner_low = to_np(env.low[:2]) + env.region_margin
+    inner_high = to_np(env.high[:2]) - env.region_margin
+    z_mid = 0.5 * float(env.low[2] + env.high[2])
+
+    shapes = []
+    for token, kind, params in env.label_regions():
+        params = [float(v) for v in params]
+        assert params[-2:] == [z_mid - 0.75, z_mid + 0.25]
+        if kind == "circle":
+            cx, cy, r = params[:3]
+            assert r > 0
+            lo, hi = np.array([cx - r, cy - r]), np.array([cx + r, cy + r])
+        else:
+            x_lo, x_hi, y_lo, y_hi = params[:4]
+            assert x_lo < x_hi and y_lo < y_hi
+            lo, hi = np.array([x_lo, y_lo]), np.array([x_hi, y_hi])
+        assert np.all(lo >= inner_low - 1e-6) and np.all(hi <= inner_high + 1e-6), (token, kind, params)
+        shapes.append((kind, params[:4] if kind == "rect" else params[:3]))
+
+    def rect_point_dist(rect, x, y):
+        x_lo, x_hi, y_lo, y_hi = rect
+        return np.hypot(max(x_lo - x, 0.0, x - x_hi), max(y_lo - y, 0.0, y - y_hi))
+
+    def dist(a, b):
+        (kind_a, pa), (kind_b, pb) = a, b
+        if kind_a == "circle" and kind_b == "circle":
+            return np.hypot(pa[0] - pb[0], pa[1] - pb[1]) - pa[2] - pb[2]
+        if kind_a == "rect" and kind_b == "rect":
+            dx = max(pb[0] - pa[1], pa[0] - pb[1], 0.0)
+            dy = max(pb[2] - pa[3], pa[2] - pb[3], 0.0)
+            return np.hypot(dx, dy)
+        (_, circle), (_, rect) = (a, b) if kind_a == "circle" else (b, a)
+        return rect_point_dist(rect, circle[0], circle[1]) - circle[2]
+
+    gaps = [dist(a, b) for i, a in enumerate(shapes) for b in shapes[i + 1:]]
+    assert min(gaps) >= env.region_gap - 1e-5, min(gaps)
+    assert abs(min(gaps) - env.region_gap) < 1e-5, min(gaps)
 
     print("Test completed.")
 
@@ -392,6 +444,7 @@ if __name__ == '__main__':
     parser.add_argument("--test-drone-env", action="store_true")
     parser.add_argument("--test-filter-reference", action="store_true")
     parser.add_argument("--test-label-f", action="store_true")
+    parser.add_argument("--test-regions", action="store_true")
     parser.add_argument("--test-dfa-wrapper", action="store_true")
     parser.add_argument("--visualize-init-state", action="store_true")
     parser.add_argument("--generate-gif", action="store_true")
@@ -406,6 +459,14 @@ if __name__ == '__main__':
         test(DroneEnv(n_agents=1, use_velocity_filter=True))
         test(DroneEnv(n_agents=3, use_velocity_filter=True))
         test(DroneEnv(n_agents=3, use_velocity_filter=True, max_speed=2.0, x_low=-2.0, x_high=2.0, y_low=-1.5, y_high=1.5, z_low=0.0, z_high=2.0))
+        test(DroneEnv(n_agents=3, out_of_bounds_reward=-1.0))
+        test(DroneEnv(n_agents=1, use_velocity_filter=True, out_of_bounds_reward=-1.0))
+
+    if args.test_regions:
+        test_label_regions(DroneEnv())
+        test_label_regions(DroneEnv(x_low=-2.0, x_high=2.0, y_low=-1.5, y_high=1.5, z_low=0.0, z_high=2.0))
+        test_label_regions(DroneEnv(region_margin=0.0, region_gap=0.0))
+        test_label_regions(DroneEnv(region_margin=0.4, region_gap=0.05))
 
     if args.test_filter_reference:
         big_box = dict(x_low=-50.0, x_high=50.0, y_low=-50.0, y_high=50.0, z_low=-50.0, z_high=50.0)
