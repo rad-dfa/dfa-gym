@@ -27,10 +27,29 @@ Deployment equivalents: dt = POLICY_DT, filter_dt = FILTER_DT,
 velocity_filter_tau = TAU (dfa_velocity_filter_tau_s), max_filter_accel =
 MAX_ACCEL (dfa_max_filter_acceleration_mps2), max_speed = VELOCITY_SCALE
 (dfa_velocity_scale).
+
+If, on top of the velocity filter, `use_tracking_controller=True`, the filter no
+longer moves the drone directly: its (position, velocity, acceleration) is the
+reference that the stack's controller tracks, which emulates controller tracking
+error (the filter smooths the command; tracking adds the controller's lag). In each
+filter substep h, after the reference advances, the controller requests the
+per-axis acceleration
+    request = ref_a + tracking_kp * (ref_p - p) + tracking_kv * (ref_v - v),
+a first-order motor delay moves the drone's acceleration toward it,
+    a += (1 - exp(-h / motor_tau)) * (request - a),
+and the point mass integrates it (v += h * a, trapezoidal p). The defaults are the
+stack's controller position gain (KP), velocity gain (KV) and motor delay (TAU), in
+(x, y, z) order. The reference lives in `ref_positions`/`ref_velocities`/
+`ref_accelerations` (zero unless this mode is on) and starts at the drone, while
+`positions`/`velocities`/`accelerations` are the drone's own, so observations,
+`label_f` and the out-of-bounds check all see the tracked drone. Its velocity can
+overshoot the reference's, by at most `vel_gain` per axis (see
+`tracking_velocity_gain`), which widens the observation space to match.
 """
 import jax
 import math
 import chex
+import numpy as np
 import jax.numpy as jnp
 from flax import struct
 from functools import partial
@@ -43,9 +62,13 @@ from dfa_gym.env import MultiAgentEnv, State
 class DroneEnvState(State):
     positions: jax.Array
     velocities: jax.Array
-    accelerations: jax.Array  # Velocity filter state; stays zero when the filter is off.
+    accelerations: jax.Array  # Velocity filter state (tracked drone's with the tracking controller); stays zero when the filter is off.
     prev_positions: jax.Array  # Positions one step earlier, so label_f only fires on entering a region.
     time: int
+    # Velocity filter state that the tracking controller follows; stays zero unless use_tracking_controller.
+    ref_positions: jax.Array
+    ref_velocities: jax.Array
+    ref_accelerations: jax.Array
 
 class DroneEnv(MultiAgentEnv):
 
@@ -69,6 +92,10 @@ class DroneEnv(MultiAgentEnv):
         velocity_filter_tau: float = 0.1,
         max_filter_accel: float = 3.0,
         filter_dt: float = 0.005,
+        use_tracking_controller: bool = False,
+        tracking_kp: Tuple[float, float, float] = (7.1, 7.1, 11.9),
+        tracking_kv: Tuple[float, float, float] = (2.4, 2.4, 6.7),
+        motor_tau: Tuple[float, float, float] = (0.080019, 0.080019, 0.058938),
         max_steps_in_episode: int = 200,
         region_margin: float = 0.25,
         region_gap: float = 0.1,
@@ -76,6 +103,9 @@ class DroneEnv(MultiAgentEnv):
         obs_noise_std: float | Tuple[float, float] = 0.0,
     ) -> None:
         assert not (use_displacement_action and use_velocity_filter), "the velocity filter only applies to velocity actions"
+        assert use_velocity_filter or not use_tracking_controller, "the tracking controller tracks the velocity filter; set use_velocity_filter=True"
+        assert all(len(x) == 3 for x in (tracking_kp, tracking_kv, motor_tau)), "tracking_kp, tracking_kv and motor_tau are per-axis (x, y, z)"
+        assert all(t > 0 for t in motor_tau), "motor_tau must be positive"
         assert region_margin >= 0 and region_gap >= 0, "region_margin and region_gap must be non-negative"
         if isinstance(obs_noise_std, (int, float)):
             pos_noise_std = vel_noise_std = float(obs_noise_std)
@@ -95,6 +125,16 @@ class DroneEnv(MultiAgentEnv):
         self.filter_dt = filter_dt
         self.n_substeps = math.ceil(dt / filter_dt)
         self.h = dt / self.n_substeps
+        self.use_tracking_controller = use_tracking_controller
+        self.tracking_kp = tuple(float(k) for k in tracking_kp)
+        self.tracking_kv = tuple(float(k) for k in tracking_kv)
+        self.motor_tau = tuple(float(t) for t in motor_tau)
+        self.kp = jnp.array(self.tracking_kp, dtype=jnp.float32)
+        self.kv = jnp.array(self.tracking_kv, dtype=jnp.float32)
+        # Fraction of the gap to the requested acceleration the motors close in one substep.
+        self.motor_alpha = jnp.array([1.0 - math.exp(-self.h / t) for t in self.motor_tau], dtype=jnp.float32)
+        # Per-axis bound on |velocity| / max_speed: the tracked drone can overshoot its reference.
+        self.vel_gain = self.tracking_velocity_gain() if use_tracking_controller else np.ones(3)
         self.max_steps_in_episode = max_steps_in_episode
         self.region_margin = region_margin
         self.region_gap = region_gap
@@ -120,11 +160,13 @@ class DroneEnv(MultiAgentEnv):
             for agent in self.agents
         }
         # Nothing is clipped, so the last observation of an episode that ends by leaving
-        # the box can lie up to one step's reach (max_speed * dt per axis) past a wall.
-        # Observation noise widens both bounds by its maximum magnitude.
-        reach = self.max_speed * self.dt
-        pos_slack = reach + self.OBS_NOISE_MAX_SIGMAS * pos_noise_std
-        vel_bound = (self.max_speed + self.OBS_NOISE_MAX_SIGMAS * vel_noise_std) * jnp.ones(3, dtype=jnp.float32)
+        # the box can lie up to one step's reach (max_speed * dt per axis, times vel_gain
+        # with the tracking controller) past a wall. Observation noise widens both bounds
+        # by its maximum magnitude.
+        max_velocity = self.max_speed * self.vel_gain  # float64, cast to float32 only once below
+        reach = max_velocity * self.dt
+        pos_slack = jnp.asarray(reach + self.OBS_NOISE_MAX_SIGMAS * pos_noise_std, dtype=jnp.float32)
+        vel_bound = jnp.asarray(max_velocity + self.OBS_NOISE_MAX_SIGMAS * vel_noise_std, dtype=jnp.float32)
         self.observation_spaces = {
             agent: spaces.Box(
                 low=jnp.concatenate([self.low - pos_slack, -vel_bound]),
@@ -143,8 +185,10 @@ class DroneEnv(MultiAgentEnv):
         positions = jnp.zeros((self.n_agents, 3), dtype=jnp.float32)
         velocities = jnp.zeros((self.n_agents, 3), dtype=jnp.float32)
         accelerations = jnp.zeros((self.n_agents, 3), dtype=jnp.float32)
+        # The tracking controller's reference starts at the drone.
         state = DroneEnvState(
-            positions=positions, velocities=velocities, accelerations=accelerations, prev_positions=positions, time=0
+            positions=positions, velocities=velocities, accelerations=accelerations, prev_positions=positions, time=0,
+            ref_positions=positions, ref_velocities=velocities, ref_accelerations=accelerations,
         )
         return self.add_obs_noise(key, self.get_obs(state=state)), state
 
@@ -157,7 +201,14 @@ class DroneEnv(MultiAgentEnv):
     ) -> Tuple[Dict[str, chex.Array], DroneEnvState, Dict[str, float], Dict[str, bool], Dict]:
         action = jnp.stack([actions[agent] for agent in self.agents])
         action = jnp.clip(action, -self.max_action, self.max_action)
-        if self.use_velocity_filter:
+        ref_positions, ref_velocities, ref_accelerations = state.ref_positions, state.ref_velocities, state.ref_accelerations
+        if self.use_tracking_controller:
+            (ref_positions, ref_velocities, ref_accelerations), (positions, velocities, accelerations) = self.track_reference(
+                (ref_positions, ref_velocities, ref_accelerations),
+                (state.positions, state.velocities, state.accelerations),
+                self.max_speed * action,
+            )
+        elif self.use_velocity_filter:
             positions, velocities, accelerations = self.filter_velocity(
                 state.positions, state.velocities, state.accelerations, self.max_speed * action
             )
@@ -169,7 +220,8 @@ class DroneEnv(MultiAgentEnv):
 
         new_state = DroneEnvState(
             positions=positions, velocities=velocities, accelerations=accelerations,
-            prev_positions=state.positions, time=state.time + 1
+            prev_positions=state.positions, time=state.time + 1,
+            ref_positions=ref_positions, ref_velocities=ref_velocities, ref_accelerations=ref_accelerations,
         )
         # Strict, so a drone exactly on a wall is still inside. Any agent leaving ends the
         # whole episode: done agents keep stepping until __all__, and nothing would stop
@@ -201,20 +253,88 @@ class DroneEnv(MultiAgentEnv):
 
         Mirrors the deployment's `simulate_step` substep for substep (no geofence).
         """
-        tau = self.velocity_filter_tau
-
         def substep(_, carry):
-            p, v, a = carry
-            jerk = (target_velocities - v) / tau**2 - 2.0 * a / tau
-            a_next = a + self.h * jerk
-            # Vector-norm acceleration limit, not a per-axis limit.
-            magnitude = jnp.linalg.norm(a_next, axis=-1, keepdims=True)
-            a_next = a_next * jnp.where(magnitude > self.max_filter_accel, self.max_filter_accel / magnitude, 1.0)
-            v_next = v + self.h * a_next
-            p_next = p + 0.5 * self.h * (v + v_next)
-            return p_next, v_next, a_next
+            return self.filter_substep(*carry, target_velocities)
 
         return jax.lax.fori_loop(0, self.n_substeps, substep, (positions, velocities, accelerations))
+
+    def filter_substep(
+        self,
+        p: jax.Array,
+        v: jax.Array,
+        a: jax.Array,
+        target_velocities: jax.Array
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """Advances (p, v, a) by one substep `h` of the deployed velocity filter."""
+        tau = self.velocity_filter_tau
+        jerk = (target_velocities - v) / tau**2 - 2.0 * a / tau
+        a_next = a + self.h * jerk
+        # Vector-norm acceleration limit, not a per-axis limit.
+        magnitude = jnp.linalg.norm(a_next, axis=-1, keepdims=True)
+        a_next = a_next * jnp.where(magnitude > self.max_filter_accel, self.max_filter_accel / magnitude, 1.0)
+        v_next = v + self.h * a_next
+        p_next = p + 0.5 * self.h * (v + v_next)
+        return p_next, v_next, a_next
+
+    def track_reference(
+        self,
+        reference: Tuple[jax.Array, jax.Array, jax.Array],
+        drone: Tuple[jax.Array, jax.Array, jax.Array],
+        target_velocities: jax.Array
+    ) -> Tuple[Tuple[jax.Array, jax.Array, jax.Array], Tuple[jax.Array, jax.Array, jax.Array]]:
+        """Advances the velocity filter's (positions, velocities, accelerations) `reference`
+        and the point-mass `drone` tracking it by one policy step `dt`, holding
+        `target_velocities` constant throughout (see the module docstring).
+
+        Each substep first advances the reference, then the drone toward the advanced
+        reference, as in the collaborator's point-mass model of the stack.
+        """
+        def substep(_, carry):
+            (ref_p, ref_v, ref_a), (p, v, a) = carry
+            ref_p, ref_v, ref_a = self.filter_substep(ref_p, ref_v, ref_a, target_velocities)
+            request = ref_a + self.kp * (ref_p - p) + self.kv * (ref_v - v)
+            a = a + self.motor_alpha * (request - a)
+            v_next = v + self.h * a
+            p_next = p + 0.5 * self.h * (v + v_next)
+            return (ref_p, ref_v, ref_a), (p_next, v_next, a)
+
+        return jax.lax.fori_loop(0, self.n_substeps, substep, (reference, drone))
+
+    def tracking_velocity_gain(self, tol: float = 1e-12, max_seconds: float = 600.0) -> np.ndarray:
+        """Per-axis worst case of |drone velocity| / max_t |reference velocity| under the
+        tracking controller, starting from the drone at its reference.
+
+        Per axis, the substep map from the reference velocity sequence to the drone's
+        velocity is linear and time-invariant (the reference's acceleration is its
+        velocity's difference over h and its position the trapezoidal integral, exactly
+        as in `filter_substep`), so the worst case is the L1 norm of its impulse
+        response. Computed in float64; asserts the response decays, i.e. the gains are
+        stable at this h.
+        """
+        h = self.h
+        kp, kv = np.array(self.tracking_kp), np.array(self.tracking_kv)
+        alpha = 1.0 - np.exp(-h / np.array(self.motor_tau))
+        # Unit impulse in the reference velocity at the first substep.
+        ref_v_prev, ref_v = np.zeros(3), np.ones(3)
+        ref_p, p, v, a = np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3)
+        gain = np.zeros(3)
+        for _ in range(int(max_seconds / h)):
+            ref_a = (ref_v - ref_v_prev) / h
+            ref_p = ref_p + 0.5 * h * (ref_v_prev + ref_v)
+            a = a + alpha * ((ref_a + kp * (ref_p - p) + kv * (ref_v - v)) - a)
+            v_next = v + h * a
+            p = p + 0.5 * h * (v + v_next)
+            v = v_next
+            gain += np.abs(v)
+            ref_v_prev, ref_v = ref_v, np.zeros(3)
+            if np.all(np.abs(np.concatenate([v, a, p - ref_p])) < tol):
+                return gain
+            if not np.all(gain < 1e6):  # diverging
+                break
+        raise AssertionError(
+            f"tracking controller (tracking_kp={self.tracking_kp}, tracking_kv={self.tracking_kv}, "
+            f"motor_tau={self.motor_tau}) is unstable or too slow at substep h={h}"
+        )
 
     @partial(jax.jit, static_argnums=(0,))
     def get_obs(

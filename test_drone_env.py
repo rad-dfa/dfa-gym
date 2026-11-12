@@ -45,10 +45,74 @@ def simulate_step(position, velocity, acceleration, action,
     return p, v, a
 
 
+def simulate_tracking_step(ref_position, ref_velocity, ref_acceleration, position, velocity, acceleration, action,
+                           POLICY_DT, FILTER_DT, TAU, MAX_ACCEL, VELOCITY_SCALE, KP, KV, MOTOR_TAU):
+    """The collaborator's point-mass model of the stack's controller tracking the
+    velocity filter: their per-substep loop, with `simulate_step`'s filter substep as
+    the reference's step. Single agent, float64, no geofence.
+    Returns ((ref_p, ref_v, ref_a), (p, v, a)).
+    """
+    target_velocity = VELOCITY_SCALE * np.clip(action, -1.0, 1.0)
+    kp, kv, tau = np.asarray(KP), np.asarray(KV), np.asarray(MOTOR_TAU)
+
+    ref_p, ref_v, ref_a = ref_position.copy(), ref_velocity.copy(), ref_acceleration.copy()
+    p, v, a = position.copy(), velocity.copy(), acceleration.copy()
+
+    n = int(np.ceil(POLICY_DT / FILTER_DT))
+    h = POLICY_DT / n
+
+    for _ in range(n):
+        # Advance the existing reference filter.
+        jerk = (target_velocity - ref_v) / TAU**2 - 2.0 * ref_a / TAU
+        ref_a_next = ref_a + h * jerk
+        magnitude = np.linalg.norm(ref_a_next)
+        if magnitude > MAX_ACCEL:
+            ref_a_next *= MAX_ACCEL / magnitude
+        ref_v_next = ref_v + h * ref_a_next
+        ref_p += 0.5 * h * (ref_v + ref_v_next)
+        ref_v = ref_v_next
+        ref_a = ref_a_next
+
+        # Advance actual point-mass tracking.
+        a_request = ref_a + kp * (ref_p - p) + kv * (ref_v - v)
+        a += (1 - np.exp(-h / tau)) * (a_request - a)
+        v_next = v + h * a
+        p += 0.5 * h * (v + v_next)
+        v = v_next
+
+    return (ref_p, ref_v, ref_a), (p, v, a)
+
+
 def filter_constants(env):
     """`simulate_step`'s deployment constants for `env`."""
     return dict(POLICY_DT=env.dt, FILTER_DT=env.filter_dt, TAU=env.velocity_filter_tau,
                 MAX_ACCEL=env.max_filter_accel, VELOCITY_SCALE=env.max_speed)
+
+
+def tracking_constants(env):
+    """`simulate_tracking_step`'s constants for `env`."""
+    return dict(**filter_constants(env), KP=env.tracking_kp, KV=env.tracking_kv, MOTOR_TAU=env.motor_tau)
+
+
+def expected_tracking_step(env, state, actions):
+    """`simulate_tracking_step` for every agent from `state`, stacked over agents:
+    returns (ref_positions, ref_velocities, ref_accelerations, positions, velocities, accelerations)."""
+    steps = [
+        simulate_tracking_step(
+            to_np(state.ref_positions[i]), to_np(state.ref_velocities[i]), to_np(state.ref_accelerations[i]),
+            to_np(state.positions[i]), to_np(state.velocities[i]), to_np(state.accelerations[i]),
+            to_np(actions[agent]), **tracking_constants(env),
+        )
+        for i, agent in enumerate(env.agents)
+    ]
+    return tuple(np.stack(x) for x in zip(*(ref + drone for ref, drone in steps)))
+
+
+def assert_tracking_state(state, expected, atol):
+    """Asserts `state`'s reference and drone arrays match `expected_tracking_step`'s output."""
+    names = ("ref_positions", "ref_velocities", "ref_accelerations", "positions", "velocities", "accelerations")
+    for name, value, tol in zip(names, expected, atol):
+        assert np.allclose(getattr(state, name), value, atol=tol), (name, np.abs(to_np(getattr(state, name)) - value).max())
 
 
 def to_np(x):
@@ -57,13 +121,15 @@ def to_np(x):
 
 def test(env, n=100, seed=42):
     """Checks DroneEnv.step_env against an independent recomputation: unclipped
-    dynamics (the deployment's `simulate_step` for the velocity filter), and an
-    episode that ends on the step any agent leaves [low, high], with
-    `out_of_bounds_reward` for each agent that left.
+    dynamics (the deployment's `simulate_step` for the velocity filter, and
+    `simulate_tracking_step` for the tracking controller), and an episode that ends
+    on the step any agent leaves [low, high], with `out_of_bounds_reward` for each
+    agent that left.
     """
 
     print(f"Running tests for {env.name} (n_agents={env.n_agents}, use_displacement_action={env.use_displacement_action}, "
-          f"use_velocity_filter={env.use_velocity_filter}, out_of_bounds_reward={env.out_of_bounds_reward}).")
+          f"use_velocity_filter={env.use_velocity_filter}, use_tracking_controller={env.use_tracking_controller}, "
+          f"out_of_bounds_reward={env.out_of_bounds_reward}).")
     key = jax.random.PRNGKey(seed)
     low, high = to_np(env.low), to_np(env.high)
     n_out_of_bounds = 0
@@ -76,6 +142,8 @@ def test(env, n=100, seed=42):
         assert jnp.all(state.velocities == 0.0)
         assert jnp.all(state.accelerations == 0.0)
         assert jnp.array_equal(state.prev_positions, state.positions)
+        assert jnp.array_equal(state.ref_positions, state.positions)
+        assert jnp.all(state.ref_velocities == 0.0) and jnp.all(state.ref_accelerations == 0.0)
         done = False
         steps = 0
 
@@ -90,7 +158,15 @@ def test(env, n=100, seed=42):
 
             obs, new_state, rewards, dones, _ = env.step_env(step_key, state, actions)
 
-            if env.use_velocity_filter:
+            if env.use_tracking_controller:
+                # Recompute in float64 from the same prior state, as for the velocity filter.
+                expected = expected_tracking_step(env, state, actions)
+                assert_tracking_state(new_state, expected, atol=(1e-5, 1e-5, 1e-4, 1e-5, 1e-5, 1e-4))
+                expected_positions, expected_velocities = expected[3], expected[4]
+                assert jnp.all(jnp.linalg.norm(new_state.ref_accelerations, axis=-1) <= env.max_filter_accel + 1e-5)
+                # The reference stays within max_speed; the drone tracking it, within vel_gain times that.
+                assert np.all(np.abs(expected[1]) <= env.max_speed + 1e-6)
+            elif env.use_velocity_filter:
                 # Recompute in float64 from the same prior state, so only one step of
                 # float32 rounding separates this from the jitted step_env.
                 expected = [
@@ -113,7 +189,10 @@ def test(env, n=100, seed=42):
                 assert np.allclose(new_state.positions, expected_positions, atol=1e-5)
                 assert np.allclose(new_state.velocities, expected_velocities, atol=1e-4)
                 assert jnp.all(new_state.accelerations == 0.0)
-            assert np.all(np.abs(expected_velocities) <= env.max_speed + 1e-6)
+            if not env.use_tracking_controller:
+                assert jnp.all(new_state.ref_positions == 0.0) and jnp.all(new_state.ref_velocities == 0.0)
+                assert jnp.all(new_state.ref_accelerations == 0.0)
+            assert np.all(np.abs(expected_velocities) <= env.max_speed * env.vel_gain + 1e-6)
             assert jnp.array_equal(new_state.prev_positions, state.positions)
 
             for i, agent in enumerate(env.agents):
@@ -201,6 +280,105 @@ def test_filter_matches_reference(env, n=10, seed=42):
         print(f"Test completed for {i + 1} samples.", end="\r")
 
     print(f"Test completed for {n} samples.")
+
+
+def test_tracking_matches_reference(env, n=10, seed=42):
+    """Checks DroneEnv's tracking controller against the collaborator's
+    `simulate_tracking_step`, like `test_filter_matches_reference` (one-step and
+    open-loop; `env` needs a box no drone leaves). Also checks that the reference is
+    exactly what the velocity filter alone would do with the same actions, and that
+    the drone genuinely lags it while staying close.
+    """
+
+    assert env.use_tracking_controller
+    print(f"Running tracking reference tests for {env.name} (n_agents={env.n_agents}, tracking_kp={env.tracking_kp}, "
+          f"tracking_kv={env.tracking_kv}, motor_tau={env.motor_tau}, filter_dt={env.filter_dt}, max_speed={env.max_speed}).")
+    filter_env = DroneEnv(
+        n_agents=env.n_agents, x_low=float(env.low[0]), x_high=float(env.high[0]), y_low=float(env.low[1]),
+        y_high=float(env.high[1]), z_low=float(env.low[2]), z_high=float(env.high[2]), max_speed=env.max_speed,
+        dt=env.dt, use_velocity_filter=True, velocity_filter_tau=env.velocity_filter_tau,
+        max_filter_accel=env.max_filter_accel, filter_dt=env.filter_dt, max_steps_in_episode=env.max_steps_in_episode,
+    )
+    key = jax.random.PRNGKey(seed)
+    max_lag = 0.0
+
+    for i in range(n):
+
+        key, subkey = jax.random.split(key)
+        _, state = env.reset(key=subkey)
+        _, filter_state = filter_env.reset(key=subkey)
+        trajectory = [((np.zeros(3),) * 3, (np.zeros(3),) * 3) for _ in env.agents]
+        done = False
+
+        while not done:
+            key, action_key, step_key = jax.random.split(key, 3)
+            # also exercise the [-1, 1] action clipping
+            action_keys = jax.random.split(action_key, env.n_agents)
+            actions = {
+                agent: jax.random.uniform(k, (3,), minval=-1.5, maxval=1.5)
+                for agent, k in zip(env.agents, action_keys)
+            }
+
+            obs, new_state, _, dones, _ = env.step_env(step_key, state, actions)
+            _, filter_state, _, _, _ = filter_env.step_env(step_key, filter_state, actions)
+
+            assert_tracking_state(new_state, expected_tracking_step(env, state, actions),
+                                  atol=(1e-5, 1e-5, 1e-4, 1e-5, 1e-5, 1e-4))
+
+            for j, agent in enumerate(env.agents):
+                trajectory[j] = simulate_tracking_step(*trajectory[j][0], *trajectory[j][1], to_np(actions[agent]),
+                                                       **tracking_constants(env))
+                (ref_p, ref_v, ref_a), (p, v, a) = trajectory[j]
+                for value, expected, tol in zip(
+                    (new_state.ref_positions, new_state.ref_velocities, new_state.ref_accelerations,
+                     new_state.positions, new_state.velocities, new_state.accelerations),
+                    (ref_p, ref_v, ref_a, p, v, a), (1e-4, 1e-4, 1e-3, 1e-4, 1e-4, 1e-3),
+                ):
+                    assert np.allclose(value[j], expected, atol=tol), (agent, np.abs(to_np(value[j]) - expected).max())
+                assert np.all(p > to_np(env.low)) and np.all(p < to_np(env.high)), "drone left the box; use a larger box"
+                assert jnp.array_equal(obs[agent], jnp.concatenate([new_state.positions[j], new_state.velocities[j]]))
+                assert np.all(np.abs(v) <= env.max_speed * env.vel_gain + 1e-6)
+
+            # The reference is the velocity filter alone, driven by the same actions.
+            assert np.allclose(new_state.ref_positions, filter_state.positions, atol=1e-5)
+            assert np.allclose(new_state.ref_velocities, filter_state.velocities, atol=1e-5)
+            assert np.allclose(new_state.ref_accelerations, filter_state.accelerations, atol=1e-4)
+            max_lag = max(max_lag, float(jnp.max(jnp.abs(new_state.ref_positions - new_state.positions))))
+
+            state = new_state
+            done = dones["__all__"]
+
+        print(f"Test completed for {i + 1} samples.", end="\r")
+
+    # The drone lags its reference, but tracks it.
+    assert 1e-3 < max_lag < 0.5 * env.max_speed, max_lag
+    print(f"Test completed for {n} samples (max |ref_position - position| = {max_lag:.3f}).")
+
+
+def test_tracking_args():
+    """Checks DroneEnv's tracking-controller argument checks, and that the default
+    gains' velocity gain is the impulse response's L1 norm (> 1: the drone overshoots)."""
+
+    print("Running tracking controller argument tests for DroneEnv.")
+    for kwargs in (
+        dict(use_tracking_controller=True),  # needs the velocity filter as its reference
+        dict(use_tracking_controller=True, use_displacement_action=True),
+        dict(use_velocity_filter=True, use_tracking_controller=True, tracking_kp=(7.1, 7.1)),
+        dict(use_velocity_filter=True, use_tracking_controller=True, motor_tau=(0.08, 0.0, 0.06)),
+        dict(use_velocity_filter=True, use_tracking_controller=True, tracking_kv=(-2.4, 2.4, 6.7)),  # unstable
+    ):
+        try:
+            DroneEnv(**kwargs)
+        except AssertionError:
+            continue
+        raise AssertionError(f"DroneEnv({kwargs}) did not raise")
+
+    env = DroneEnv(use_velocity_filter=True, use_tracking_controller=True)
+    assert env.vel_gain[0] == env.vel_gain[1] and np.all(env.vel_gain > 1.0), env.vel_gain
+    assert np.all(DroneEnv(use_velocity_filter=True).vel_gain == 1.0)
+    # The gains don't affect the other modes.
+    assert np.all(DroneEnv(use_velocity_filter=True, tracking_kv=(-2.4, 2.4, 6.7)).vel_gain == 1.0)
+    print(f"Test completed (default vel_gain = {env.vel_gain}).")
 
 
 def test_label_f_on_entry():
@@ -323,7 +501,8 @@ def test_obs_noise(n=20, seed=42, **kwargs):
     clean_env = DroneEnv(**{**kwargs, "obs_noise_std": 0.0})
     assert env.use_obs_noise and not clean_env.use_obs_noise
     print(f"Running observation noise tests for {env.name} (n_agents={env.n_agents}, "
-          f"use_velocity_filter={env.use_velocity_filter}, obs_noise_std={env.obs_noise_std}).")
+          f"use_velocity_filter={env.use_velocity_filter}, use_tracking_controller={env.use_tracking_controller}, "
+          f"obs_noise_std={env.obs_noise_std}).")
     scale = to_np(env.obs_noise_scale)
     key = jax.random.PRNGKey(seed)
     noises = []
@@ -474,6 +653,9 @@ def test_dfa_wrapper(env, n=5, seed=42):
             assert jnp.array_equal(new_state.env_state.positions, expected_env_state.positions)
             assert jnp.array_equal(new_state.env_state.velocities, expected_env_state.velocities)
             assert jnp.array_equal(new_state.env_state.accelerations, expected_env_state.accelerations)
+            assert jnp.array_equal(new_state.env_state.ref_positions, expected_env_state.ref_positions)
+            assert jnp.array_equal(new_state.env_state.ref_velocities, expected_env_state.ref_velocities)
+            assert jnp.array_equal(new_state.env_state.ref_accelerations, expected_env_state.ref_accelerations)
             assert jnp.array_equal(new_state.env_state.time, expected_env_state.time)
             for agent in env.agents:
                 assert jnp.array_equal(new_state.env_obs[agent], expected_env_obs[agent])
@@ -521,6 +703,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--test-drone-env", action="store_true")
     parser.add_argument("--test-filter-reference", action="store_true")
+    parser.add_argument("--test-tracking-reference", action="store_true")
     parser.add_argument("--test-label-f", action="store_true")
     parser.add_argument("--test-regions", action="store_true")
     parser.add_argument("--test-obs-noise", action="store_true")
@@ -540,6 +723,11 @@ if __name__ == '__main__':
         test(DroneEnv(n_agents=3, use_velocity_filter=True, max_speed=2.0, x_low=-2.0, x_high=2.0, y_low=-1.5, y_high=1.5, z_low=0.0, z_high=2.0))
         test(DroneEnv(n_agents=3, out_of_bounds_reward=-1.0))
         test(DroneEnv(n_agents=1, use_velocity_filter=True, out_of_bounds_reward=-1.0))
+        tracking = dict(use_velocity_filter=True, use_tracking_controller=True)
+        test(DroneEnv(n_agents=1, **tracking))
+        test(DroneEnv(n_agents=3, **tracking))
+        test(DroneEnv(n_agents=3, max_speed=2.0, x_low=-2.0, x_high=2.0, y_low=-1.5, y_high=1.5, z_low=0.0, z_high=2.0, **tracking))
+        test(DroneEnv(n_agents=1, out_of_bounds_reward=-1.0, **tracking))
 
     if args.test_regions:
         test_label_regions(DroneEnv())
@@ -551,12 +739,21 @@ if __name__ == '__main__':
         test_obs_noise(n_agents=3, obs_noise_std=(0.02, 0.1))
         test_obs_noise(n_agents=1, use_velocity_filter=True, obs_noise_std=0.05)
         test_obs_noise(n_agents=2, obs_noise_std=(0.0, 0.1))
+        test_obs_noise(n_agents=2, use_velocity_filter=True, use_tracking_controller=True, obs_noise_std=(0.02, 0.1))
 
+    big_box = dict(x_low=-50.0, x_high=50.0, y_low=-50.0, y_high=50.0, z_low=-50.0, z_high=50.0)
     if args.test_filter_reference:
-        big_box = dict(x_low=-50.0, x_high=50.0, y_low=-50.0, y_high=50.0, z_low=-50.0, z_high=50.0)
         test_filter_matches_reference(DroneEnv(n_agents=1, use_velocity_filter=True, **big_box))
         test_filter_matches_reference(DroneEnv(n_agents=3, use_velocity_filter=True, max_speed=2.0, velocity_filter_tau=0.2,
                                                max_filter_accel=5.0, filter_dt=0.01, **big_box))
+
+    if args.test_tracking_reference:
+        test_tracking_args()
+        test_tracking_matches_reference(DroneEnv(n_agents=1, use_velocity_filter=True, use_tracking_controller=True, **big_box))
+        test_tracking_matches_reference(DroneEnv(n_agents=3, use_velocity_filter=True, use_tracking_controller=True,
+                                                 max_speed=2.0, velocity_filter_tau=0.2, max_filter_accel=5.0, filter_dt=0.01,
+                                                 tracking_kp=(5.0, 6.0, 10.0), tracking_kv=(2.0, 3.0, 5.0),
+                                                 motor_tau=(0.05, 0.1, 0.07), **big_box))
 
     if args.test_label_f:
         test_label_f_on_entry()
@@ -572,6 +769,9 @@ if __name__ == '__main__':
         test_dfa_wrapper(DFAWrapper(env=env, sampler=RADSampler(n_tokens=env.n_tokens)))
 
         env = DroneEnv(n_agents=3, obs_noise_std=(0.02, 0.1), max_steps_in_episode=20)
+        test_dfa_wrapper(DFAWrapper(env=env, sampler=RADSampler(n_tokens=env.n_tokens)))
+
+        env = DroneEnv(n_agents=3, use_velocity_filter=True, use_tracking_controller=True, max_steps_in_episode=20)
         test_dfa_wrapper(DFAWrapper(env=env, sampler=RADSampler(n_tokens=env.n_tokens)))
 
     if args.visualize_init_state:
